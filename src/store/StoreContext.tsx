@@ -1,0 +1,221 @@
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { db } from '../db/database'
+import type { QRecord, HistoryEntry, MockRun, AiReview, AppSettings } from '../lib/types'
+import { freshRecord, applyAttempt } from '../lib/scheduler'
+import { scoreAnswer, isAnswerBlank } from '../lib/scoring'
+import type { Question } from '../lib/types'
+
+export interface SubmitOutcome {
+  isCorrect: boolean | null
+  blank: boolean
+}
+
+interface StoreValue {
+  ready: boolean
+  records: Map<string, QRecord>
+  history: HistoryEntry[]
+  mocks: MockRun[]
+  aiReviews: AiReview[]
+  settings: AppSettings
+  submitAnswer: (
+    q: Question,
+    answer: string | null,
+    mode: string,
+    sessionId: string,
+    usedAI?: boolean,
+  ) => Promise<SubmitOutcome>
+  saveSubjectiveAttempt: (
+    q: Question,
+    answer: string,
+    mode: string,
+    sessionId: string,
+    usedAI?: boolean,
+  ) => Promise<void>
+  getRecord: (qid: string) => QRecord | undefined
+  saveAiReview: (r: AiReview) => Promise<void>
+  saveMockRun: (m: MockRun) => Promise<void>
+  deleteMockRun: (id: string) => Promise<void>
+  updateSettings: (s: Partial<AppSettings>) => Promise<void>
+  clearHistory: () => Promise<void>
+  resetAllProgress: () => Promise<void>
+  importRecords: (records: QRecord[], history: HistoryEntry[], mocks: MockRun[], aiReviews: AiReview[]) => Promise<void>
+  clearWrong: (qids: string[]) => Promise<void>
+}
+
+const StoreContext = createContext<StoreValue | null>(null)
+
+export function StoreProvider({ children }: { children: ReactNode }) {
+  const [ready, setReady] = useState(false)
+  const [records, setRecords] = useState<Map<string, QRecord>>(new Map())
+  const [history, setHistory] = useState<HistoryEntry[]>([])
+  const [mocks, setMocks] = useState<MockRun[]>([])
+  const [aiReviews, setAiReviews] = useState<AiReview[]>([])
+  const [settings, setSettings] = useState<AppSettings>({
+    theme: 'auto',
+    reviewIntervalBase: 1,
+    studyTarget: 30,
+    dailyGoalQuestions: 30,
+  })
+
+  const refresh = useCallback(async () => {
+    const [recs, hist, mks, aiv] = await Promise.all([
+      db.records.toArray(),
+      db.history.toArray(),
+      db.mocks.toArray(),
+      db.aiReviews.toArray(),
+    ])
+    setRecords(new Map(recs.map((r) => [r.qid, r])))
+    setHistory(hist.sort((a, b) => b.submittedAt - a.submittedAt))
+    setMocks(mks.sort((a, b) => b.startedAt - a.startedAt))
+    setAiReviews(aiv.sort((a, b) => b.createdAt - a.createdAt))
+  }, [])
+
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      await refresh()
+      const s = await db.settings.get('main')
+      if (alive && s) setSettings(s)
+      if (alive) setReady(true)
+    })()
+    return () => {
+      alive = false
+    }
+  }, [refresh])
+
+  const getRecord = useCallback((qid: string) => records.get(qid), [records])
+
+  /** Persist a graded objective attempt. Blank answers are stored as wrong-but-not-correct. */
+  const submitAnswer = useCallback<StoreValue['submitAnswer']>(
+    async (q, answer, mode, sessionId, usedAI = false) => {
+      const now = Date.now()
+      const blank = isAnswerBlank(q, answer)
+      const isCorrect = scoreAnswer(q, answer)
+      const entry: HistoryEntry = {
+        id: `h-${now}-${q.id}-${Math.random().toString(36).slice(2, 7)}`,
+        qid: q.id,
+        mode,
+        sessionId,
+        answer: answer ?? null,
+        isCorrect,
+        submittedAt: now,
+        usedAI,
+      }
+      const rec = records.get(q.id) ?? freshRecord(q.id, now)
+      const next: QRecord = applyAttempt(
+        { ...rec, ease: Math.max(rec.ease, settings.reviewIntervalBase) },
+        isCorrect === true,
+        now,
+      )
+      next.lastAnswer = answer ?? null
+      next.lastCorrect = isCorrect
+      await db.transaction('rw', db.records, db.history, async () => {
+        await db.records.put(next)
+        await db.history.add(entry)
+      })
+      await refresh()
+      return { isCorrect, blank }
+    },
+    [records, refresh, settings.reviewIntervalBase],
+  )
+
+  const saveSubjectiveAttempt = useCallback<StoreValue['saveSubjectiveAttempt']>(
+    async (q, answer, mode, sessionId, usedAI = false) => {
+      const now = Date.now()
+      const entry: HistoryEntry = {
+        id: `h-${now}-${q.id}-${Math.random().toString(36).slice(2, 7)}`,
+        qid: q.id,
+        mode,
+        sessionId,
+        answer,
+        isCorrect: null,
+        submittedAt: now,
+        usedAI,
+      }
+      const rec = records.get(q.id) ?? freshRecord(q.id, now)
+      // subjective attempts count as "attempted" but never auto-correct
+      await db.transaction('rw', db.records, db.history, async () => {
+        await db.records.put({
+          ...rec,
+          attempts: rec.attempts + 1,
+          lastSeenAt: now,
+          lastCorrect: null,
+          lastAnswer: answer,
+          nextReviewAt: now + 24 * 3600 * 1000,
+        })
+        await db.history.add(entry)
+      })
+      await refresh()
+    },
+    [records, refresh],
+  )
+
+  const value = useMemo<StoreValue>(
+    () => ({
+      ready,
+      records,
+      history,
+      mocks,
+      aiReviews,
+      settings,
+      submitAnswer,
+      saveSubjectiveAttempt,
+      getRecord,
+      saveAiReview: async (r: AiReview) => {
+        await db.aiReviews.put(r)
+        await refresh()
+      },
+      saveMockRun: async (m: MockRun) => {
+        await db.mocks.put(m)
+        await refresh()
+      },
+      deleteMockRun: async (id: string) => {
+        await db.mocks.delete(id)
+        await refresh()
+      },
+      updateSettings: async (s: Partial<AppSettings>) => {
+        const merged = { ...settings, ...s }
+        await db.settings.put({ ...merged, id: 'main' })
+        setSettings(merged)
+      },
+      clearHistory: async () => {
+        await db.history.clear()
+        await refresh()
+      },
+      resetAllProgress: async () => {
+        await db.transaction('rw', db.records, db.history, db.mocks, db.aiReviews, async () => {
+          await db.records.clear()
+          await db.history.clear()
+          await db.mocks.clear()
+          await db.aiReviews.clear()
+        })
+        await refresh()
+      },
+      importRecords: async (recs, hist, mks, aiv) => {
+        await db.transaction('rw', db.records, db.history, db.mocks, db.aiReviews, async () => {
+          await db.records.bulkPut(recs)
+          await db.history.bulkPut(hist)
+          await db.mocks.bulkPut(mks)
+          await db.aiReviews.bulkPut(aiv)
+        })
+        await refresh()
+      },
+      clearWrong: async (qids: string[]) => {
+        await db.transaction('rw', db.records, db.history, async () => {
+          for (const qid of qids) await db.records.delete(qid)
+          await db.history.where('qid').anyOf(qids).delete()
+        })
+        await refresh()
+      },
+    }),
+    [ready, records, history, mocks, aiReviews, settings, submitAnswer, saveSubjectiveAttempt, getRecord, refresh],
+  )
+
+  return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>
+}
+
+export function useStore(): StoreValue {
+  const ctx = useContext(StoreContext)
+  if (!ctx) throw new Error('useStore must be used within StoreProvider')
+  return ctx
+}

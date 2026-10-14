@@ -1,0 +1,139 @@
+import { useMemo, useState } from 'react'
+import { useStore } from '../store/StoreContext'
+import { subjectiveQuestions, TYPE_LABEL } from '../lib/bank'
+import { selectQuestions } from '../lib/scheduler'
+import { QuestionRunner } from '../components/QuestionRunner'
+import { CardPad, PageHead, Tag } from '../components/ui'
+import { Question } from '../lib/types'
+
+/** Structure hints for the two subjective types — auxiliary study reference, clearly labelled as such. */
+const STRUCTURE_HINT: Record<string, string[]> = {
+  short: [
+    '定义句：先给出核心概念的精确定义（谁、是什么、属于什么范畴）',
+    '分点展开：按教材逻辑分点作答，一点一条，避免写成整段',
+    '关键词：优先使用教材原文表述，如“两个结合”“十个明确”等',
+    '小结：用一句话收束，点明其地位或意义',
+  ],
+  material: [
+    '回扣材料：先引用/概括材料中的关键信息，说明“材料说了什么”',
+    '理论定位：点明材料体现的教材知识点与核心概念',
+    '分层分析：按“是什么—为什么—怎么办”或“理论—材料—结论”分层',
+    '结论升华：落到教材表述与实践意义上，避免只复述材料',
+  ],
+}
+
+export function Subjective({ params }: { params: Record<string, string> }) {
+  const { records, ready } = useStore()
+  const [kind, setKind] = useState<'short' | 'material'>((params.kind as 'short' | 'material') ?? 'short')
+  const [count, setCount] = useState(3)
+  const [session, setSession] = useState<Question[] | null>(null)
+  const [sessionId, setSessionId] = useState('')
+
+  const pool = useMemo(() => subjectiveQuestions.filter((q) => q.type === kind), [kind])
+  const attempted = useMemo(() => pool.filter((q) => (records.get(q.id)?.attempts ?? 0) > 0).length, [pool, records])
+
+  const start = () => {
+    if (pool.length === 0) return
+    const picked = selectQuestions({
+      pool,
+      records: records as never,
+      now: Date.now(),
+      count: Math.min(count, pool.length),
+    })
+    setSession(picked)
+    setSessionId(`s-${Date.now()}`)
+  }
+
+  if (!ready) return null
+
+  return (
+    <>
+      <PageHead
+        title="主观题训练"
+        desc="题库仅提供简答题与材料分析论述题的题干，未提供标准答案。系统不伪造官方答案；重点训练答题结构、核心概念、采分点与材料联系。"
+      />
+
+      {!session && (
+        <>
+          <CardPad>
+            <div className="card-title">选择题型</div>
+            <div className="btn-row" style={{ marginBottom: 14 }}>
+              {(['short', 'material'] as const).map((k) => (
+                <button key={k} className={`btn ${kind === k ? 'btn-primary' : ''}`} onClick={() => setKind(k)}>
+                  {TYPE_LABEL[k]}
+                </button>
+              ))}
+              <span className="muted-2">
+                共 {pool.length} 题 · 已训练 {attempted} 题
+              </span>
+            </div>
+
+            <div className="card-title">答题结构参考（辅助学习参考，非官方答案）</div>
+            <div className="ai-box">
+              <ol style={{ margin: 0, paddingLeft: 20, fontSize: 13.5, lineHeight: 1.9 }}>
+                {STRUCTURE_HINT[kind].map((s, i) => (
+                  <li key={i}>{s}</li>
+                ))}
+              </ol>
+              <div className="muted-2" style={{ marginTop: 8 }}>
+                来源：依据题型通用作答规范整理，用于组织你自己的作答，不代表题库官方答案。
+              </div>
+            </div>
+
+            <div className="divider" />
+            <div className="card-title">本轮题量</div>
+            <div className="btn-row" style={{ marginBottom: 14 }}>
+              {[1, 2, 3, 5, 8].map((n) => (
+                <button
+                  key={n}
+                  className={`btn btn-sm ${count === n ? 'btn-primary' : ''}`}
+                  onClick={() => setCount(n)}
+                >
+                  {n} 题
+                </button>
+              ))}
+              <span className="muted-2">可用 {pool.length} 题</span>
+            </div>
+
+            <button className="btn btn-primary btn-lg" onClick={start} disabled={pool.length === 0}>
+              开始训练（{Math.min(count, pool.length)} 题）
+            </button>
+          </CardPad>
+
+          <CardPad style={{ marginTop: 14 }}>
+            <div className="card-title">本题库主观题清单</div>
+            <div className="muted" style={{ marginBottom: 10 }}>
+              {kind === 'short' ? '简答题' : '材料分析论述题'}共 {pool.length} 道，均未附标准答案。
+            </div>
+            <div className="col" style={{ gap: 6 }}>
+              {pool.slice(0, 12).map((q) => (
+                <div
+                  key={q.id}
+                  className="row-between"
+                  style={{ borderBottom: '1px solid var(--border)', paddingBottom: 6 }}
+                >
+                  <span style={{ fontSize: 13.5 }}>
+                    {q.bankNo}. {q.stem.split('\n')[0].slice(0, 46)}…
+                  </span>
+                  <Tag>{records.get(q.id)?.attempts ? '已训练' : '未训练'}</Tag>
+                </div>
+              ))}
+              {pool.length > 12 && <div className="muted-2">……共 {pool.length} 题，练习时随机抽取。</div>}
+            </div>
+          </CardPad>
+        </>
+      )}
+
+      {session && (
+        <QuestionRunner
+          questions={session}
+          mode="subjective"
+          sessionId={sessionId}
+          immediateFeedback
+          onFinish={() => setSession(null)}
+          finishLabel="完成本轮"
+        />
+      )}
+    </>
+  )
+}

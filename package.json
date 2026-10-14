@@ -1,0 +1,45 @@
+{
+  "name": "exampilot-xigai",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "server": "node server/index.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ai": "node tests/ai-proxy.test.mjs",
+    "test:browser": "node tests/browser.test.mjs",
+    "test:all": "vitest run && node tests/ai-proxy.test.mjs && node tests/browser.test.mjs",
+    "typecheck": "tsc -b --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "parse:bank": "py -X utf8 tools/parse_bank.py",
+    "bank:local": "node tools/bank-local.mjs"
+  },
+  "dependencies": {
+    "dexie": "^4.0.8",
+    "dexie-react-hooks": "^4.0.8",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^10.12.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.10",
+    "puppeteer-core": "^25.13.0",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.71.2",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8"
+  }
+}

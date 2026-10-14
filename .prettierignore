@@ -1,0 +1,7 @@
+dist
+node_modules
+data/bank.json
+data/local-bank.json
+src/lib/local-bank.generated.ts
+package-lock.json
+*.md

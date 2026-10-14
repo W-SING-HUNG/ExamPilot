@@ -1,0 +1,23 @@
+chore: 初始化 ExamPilot 习概开源工程
+
+首个可用版本：完整复习系统 + 工程化配置。
+
+功能
+- 题库解析管线 tools/parse_bank.py（PDF 转结构化题库，保留原题干/选项/答案/章节/题号与 PDF 页码）
+- 评分引擎：单选严格匹配、多选集合完全一致、判断题布尔判定；未作答不计为已练或已掌握
+- 复习调度：间隔复习 + 错题再测 + 覆盖均衡选题
+- 学习系统 13 页面：总览/分章练习/专项/主观题/错题本/复习计划/全真模拟/诊断/历史/题库查阅/导入导出/AI/设置
+- 全真模拟：题型题量分值时长可配置，交卷写入同一套学习记录
+- AI 服务端代理（零依赖）：题目答疑 + 主观题参考评阅，密钥不进入前端
+
+题库与代码分离
+- 公开仓库仅含自行编写的 17 题示例题库 data/sample-bank.json
+- 完整课程题库经 npm run bank:local 本地安装，相关文件全部 git-ignored
+- 干净检出可安装、可构建、可测试（已实测：公开模式 30 单测 + 14 E2E 全通过）
+
+工程化
+- GitHub Actions CI：类型检查/Lint/格式/单测/AI 契约测试/生产构建/浏览器 E2E
+- ESLint + Prettier + TypeScript strict
+- 文档：README、CONTRIBUTING、SECURITY、CHANGELOG、docs/architecture、docs/study-strategy
+- Issue / PR 模板、.env.example（仅占位符）
+- MIT License
