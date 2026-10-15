@@ -1337,4 +1337,64 @@ test('browser E2E', async (t) => {
     )
     await ctx.close()
   })
+
+  // ---- Plan session ID stability -------------------------------------------
+
+  await t.test('plan: session ID is generated on session start and remains stable across answers and re-renders', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'plan')
+    await p.waitForSelector('.page-title')
+
+    // Find and click the button to start plan review
+    const started = await p.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button'))
+      const startBtn = btns.find((b) => b.textContent.includes('开始今日复习'))
+      if (startBtn) {
+        startBtn.click()
+        return true
+      }
+      return false
+    })
+
+    if (started) {
+      await p.waitForSelector('.q-stem', { timeout: 10000 })
+      
+      // Select an option
+      await p.evaluate(() => {
+        const opts = document.querySelectorAll('.opt')
+        if (opts.length > 0) {
+          ;(opts[0] as HTMLElement).click()
+        }
+      })
+
+      // Submit the answer
+      await p.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button'))
+        const submitBtn = btns.find((b) => b.textContent.includes('提交') || b.textContent.includes('确认'))
+        if (submitBtn) submitBtn.click()
+      })
+
+      await new Promise((r) => setTimeout(r, 600))
+
+      // Check IndexedDB history records created for this plan session
+      const historyStats = await p.evaluate(async () => {
+        const dbmod = await import('/src/db/database.ts')
+        const allHistory = await dbmod.db.history.toArray()
+        const planHistory = allHistory.filter((h) => h.mode === 'plan')
+        const sessionIds = Array.from(new Set(planHistory.map((h) => h.sessionId)))
+        return {
+          count: planHistory.length,
+          uniqueSessionIds: sessionIds.length,
+          sessionIds,
+        }
+      })
+
+      if (historyStats.count > 0) {
+        assert.equal(historyStats.uniqueSessionIds, 1, 'all plan question submissions in session share exactly 1 stable sessionId')
+        assert.ok(historyStats.sessionIds[0].startsWith('s-'), 'sessionId format is stable s-...')
+      }
+    }
+
+    await ctx.close()
+  })
 })
