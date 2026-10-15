@@ -5,6 +5,7 @@ import {
   diffImport,
   describePlan,
   checkBank,
+  filterPayloadToBank,
   makeExportPayload,
   serialize,
   bankFingerprint,
@@ -364,27 +365,29 @@ describe('io / planImport strategies and settings semantics', () => {
     expect(plan.history).toHaveLength(2)
   })
 
-  it('REGRESSION (settings): replace with a settings-less backup reports NOT written', () => {
+  it('REGRESSION (settings): replace with a settings-less backup resets to defaults', () => {
     const p = payload() as Record<string, unknown>
     delete p.settings
     const plan = planImport(p as never, 'replace', { ...emptyExisting, settings: SETTINGS })
-    expect(plan.settingsWritten).toBe(false)
+    expect(plan.settingsAction).toBe('reset')
     expect(plan.settings).toBe(null)
     expect(describePlan(plan, 'replace').join(';')).toMatch(/重置为默认值/)
   })
 
   it('replace with valid settings writes them', () => {
     const plan = planImport(payload(), 'replace', { ...emptyExisting, settings: { ...SETTINGS, theme: 'light' } })
-    expect(plan.settingsWritten).toBe(true)
+    expect(plan.settingsAction).toBe('set')
     expect(plan.settings?.theme).toBe('dark')
     expect(describePlan(plan, 'replace').join(';')).toMatch(/使用备份中的设置/)
   })
 
-  it('merge without backup settings keeps the existing settings', () => {
+  it('REGRESSION (settings): merge without backup settings KEEPS the existing settings', () => {
     const p = payload() as Record<string, unknown>
     delete p.settings
     const plan = planImport(p as never, 'merge', { ...emptyExisting, settings: SETTINGS })
-    expect(plan.settingsWritten).toBe(false)
+    // 'keep' is the action the DB honours; it must not clear the settings table.
+    expect(plan.settingsAction).toBe('keep')
+    expect(plan.settings).toBe(null)
     expect(describePlan(plan, 'merge').join(';')).toMatch(/保持当前设置不变/)
   })
 
@@ -396,17 +399,15 @@ describe('io / planImport strategies and settings semantics', () => {
 
 describe('io / diffImport', () => {
   it('counts added vs updated rows and rows destroyed by replace', () => {
-    const d = diffImport(
-      payload({ records: [mkre('q1', 1), mkre('q3', 1)], history: [mkhist('h1', 'q1'), mkhist('h9', 'q9')] }),
-      'replace',
-      {
-        records: [mkre('q1', 1), mkre('q2', 1)],
-        history: [mkhist('h1', 'q1')],
-        mocks: [],
-        aiReviews: [],
-        settings: SETTINGS,
-      },
-    )
+    const existing = {
+      records: [mkre('q1', 1), mkre('q2', 1)],
+      history: [mkhist('h1', 'q1')],
+      mocks: [],
+      aiReviews: [],
+      settings: SETTINGS,
+    }
+    const p = payload({ records: [mkre('q1', 1), mkre('q3', 1)], history: [mkhist('h1', 'q1'), mkhist('h9', 'q9')] })
+    const d = diffImport(planImport(p, 'replace', existing), 'replace', existing)
     expect(d.records.incoming).toBe(2)
     expect(d.records.added).toBe(1)
     expect(d.records.updated).toBe(1)
@@ -415,13 +416,87 @@ describe('io / diffImport', () => {
   })
 
   it('reports clearedInReplace as 0 in merge mode', () => {
-    expect(diffImport(payload(), 'merge', emptyExisting).clearedInReplace).toBe(0)
+    expect(diffImport(planImport(payload(), 'merge', emptyExisting), 'merge', emptyExisting).clearedInReplace).toBe(0)
   })
 
   it('flags a settings change only when the values actually differ', () => {
-    expect(diffImport(payload(), 'merge', { ...emptyExisting, settings: SETTINGS }).settingsChanged).toBe(false)
-    expect(
-      diffImport(payload(), 'merge', { ...emptyExisting, settings: { ...SETTINGS, theme: 'light' } }).settingsChanged,
-    ).toBe(true)
+    const same = { ...emptyExisting, settings: SETTINGS }
+    expect(diffImport(planImport(payload(), 'merge', same), 'merge', same).settingsChanged).toBe(false)
+    const diff = { ...emptyExisting, settings: { ...SETTINGS, theme: 'light' as const } }
+    expect(diffImport(planImport(payload(), 'merge', diff), 'merge', diff).settingsChanged).toBe(true)
+  })
+
+  it('diff reflects the FILTERED rows, not the raw backup size', () => {
+    const existing = { ...emptyExisting, settings: SETTINGS }
+    const p = payload({ records: [mkre('q1', 1), mkre('ghost', 1)] })
+    const plan = planImport(p, 'merge', existing, new Set(['q1']))
+    const d = diffImport(plan, 'merge', existing)
+    expect(d.records.incoming).toBe(1) // ghost excluded
+    expect(plan.filter.excludedRecords).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cross-bank safety: unverifiable progress must never reach the statistics
+// ---------------------------------------------------------------------------
+
+describe('io / filterPayloadToBank', () => {
+  it('keeps verifiable rows and excludes rows whose question is absent', () => {
+    const p = payload({
+      records: [mkre('q1', 1), mkre('ghost', 1)],
+      history: [mkhist('h1', 'q1'), mkhist('h2', 'ghost')],
+      aiReviews: [mkai('a1', 'q1'), mkai('a2', 'ghost')],
+    })
+    const { payload: kept, report } = filterPayloadToBank(p, new Set(['q1']))
+    expect(kept.records.map((r) => r.qid)).toEqual(['q1'])
+    expect(kept.history.map((h) => h.qid)).toEqual(['q1'])
+    expect(kept.aiReviews.map((a) => a.qid)).toEqual(['q1'])
+    expect(report.excludedRecords).toBe(1)
+    expect(report.excludedHistory).toBe(1)
+    expect(report.excludedAiReviews).toBe(1)
+    expect(report.nothingVerifiable).toBe(false)
+  })
+
+  it('drops a mock unless EVERY referenced question exists', () => {
+    const full = { ...mkmock('m1'), submissions: { q1: 'A' } }
+    const partial = { ...mkmock('m2'), submissions: { q1: 'A', ghost: 'B' } }
+    const { payload: kept, report } = filterPayloadToBank(payload({ mocks: [full, partial] }), new Set(['q1']))
+    expect(kept.mocks.map((m) => m.id)).toEqual(['m1'])
+    expect(report.excludedMocks).toBe(1)
+  })
+
+  it('reports nothingVerifiable when no row matches the current bank', () => {
+    const p = payload({
+      records: [mkre('ghost', 1)],
+      history: [mkhist('h', 'ghost')],
+      mocks: [],
+      aiReviews: [],
+    })
+    const { payload: kept, report } = filterPayloadToBank(p, new Set(['q1']))
+    expect(kept.records).toHaveLength(0)
+    expect(kept.history).toHaveLength(0)
+    expect(report.nothingVerifiable).toBe(true)
+  })
+
+  it('REGRESSION: planImport through a different bank excludes unverifiable progress', () => {
+    const p = payload({
+      records: [mkre('ghost', 1)],
+      history: [],
+      mocks: [],
+      aiReviews: [],
+      bankFingerprint: 'other-bank',
+    })
+    const plan = planImport(p, 'replace', emptyExisting, new Set(['q1']))
+    // nothing unverifiable reaches the write plan
+    expect(plan.records).toHaveLength(0)
+    expect(plan.filter.excludedRecords).toBe(1)
+    expect(plan.filter.nothingVerifiable).toBe(true)
+  })
+
+  it('a matching bank keeps everything (no false positives)', () => {
+    const p = payload({ records: [mkre('q1', 1), mkre('q2', 1)] })
+    const plan = planImport(p, 'merge', emptyExisting, new Set(['q1', 'q2']))
+    expect(plan.records).toHaveLength(2)
+    expect(plan.filter.excludedRecords).toBe(0)
   })
 })

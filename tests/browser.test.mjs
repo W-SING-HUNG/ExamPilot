@@ -828,15 +828,47 @@ test('browser E2E', async (t) => {
     await ctx.close()
   })
 
-  await t.test('UI: fingerprint mismatch blocks restore until acknowledged', async () => {
+  await t.test('UI: fingerprint mismatch is explained and unverifiable rows are excluded (no deadlock)', async () => {
     const { p, ctx } = await freshPage()
     await nav(p, 'io')
     await p.waitForSelector('.page-title')
+    // A backup from a DIFFERENT bank that still references one REAL current
+    // question plus one question that does not exist here.
     await p.evaluate(async () => {
       const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      const realId = bankMod.allQuestions[0].id
+      globalThis.__realId = realId
       const payload = m.makeExportPayload({
         settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
-        records: [],
+        records: [
+          {
+            qid: realId,
+            status: 'learning',
+            attempts: 2,
+            correctCount: 1,
+            wrongCount: 1,
+            lastSeenAt: 1,
+            lastCorrect: false,
+            lastAnswer: 'A',
+            intervalDays: 1,
+            ease: 2,
+            nextReviewAt: 1,
+          },
+          {
+            qid: 'ghost-does-not-exist',
+            status: 'learning',
+            attempts: 5,
+            correctCount: 5,
+            wrongCount: 0,
+            lastSeenAt: 1,
+            lastCorrect: true,
+            lastAnswer: 'A',
+            intervalDays: 1,
+            ease: 2,
+            nextReviewAt: 1,
+          },
+        ],
         history: [],
         mocks: [],
         aiReviews: [],
@@ -851,13 +883,91 @@ test('browser E2E', async (t) => {
 
     const body = await p.evaluate(() => document.body.textContent)
     assert.match(body, /题库不一致/, 'mismatch is surfaced')
-    assert.match(body, /系统不会自动执行恢复/, 'auto-restore is explicitly refused')
+    assert.match(body, /逐题匹配|只在/, 'the matching rule is explained')
+    assert.match(body, /已排除 1 条/, 'the excluded row count is stated')
+
+    // NOT a deadlock: there is verifiable data, so confirm must be actionable.
+    const disabled = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+      return b ? b.disabled : null
+    })
+    assert.equal(disabled, false, 'confirm must be actionable when some rows are verifiable')
+
+    // Confirm, then verify ONLY the verifiable row reached the database.
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn'))
+        .find((x) => x.textContent.trim() === '确认导入')
+        ?.click()
+    })
+    await p.waitForFunction(() => document.body.textContent.includes('导入完成'), { timeout: 15000 })
+    const stored = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      const snap = await dbmod.snapshotDb(dbmod.db)
+      return { qids: snap.records.map((r) => r.qid), count: snap.records.length }
+    })
+    assert.equal(stored.count, 1, 'only the verifiable record is imported')
+    assert.ok(!stored.qids.includes('ghost-does-not-exist'), 'unverifiable progress never enters the DB')
+    await ctx.close()
+  })
+
+  await t.test('UI: a backup with NO verifiable rows explains why nothing can be imported', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const payload = m.makeExportPayload({
+        settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
+        records: [
+          {
+            qid: 'ghost-1',
+            status: 'learning',
+            attempts: 1,
+            correctCount: 1,
+            wrongCount: 0,
+            lastSeenAt: 1,
+            lastCorrect: true,
+            lastAnswer: 'A',
+            intervalDays: 1,
+            ease: 2,
+            nextReviewAt: 1,
+          },
+        ],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: 'another-bank',
+        bankCount: 3,
+      })
+      globalThis.__backupText = m.serialize(payload)
+    })
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'nothing.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /没有任何数据能对应到当前题库/, 'the reason is explained, not a silent deadlock')
+    assert.match(body, /没有可导入的内容/)
 
     const disabled = await p.evaluate(() => {
       const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
       return b ? b.disabled : null
     })
-    assert.equal(disabled, true, 'confirm is blocked on a fingerprint mismatch')
+    assert.equal(disabled, true, 'confirm is blocked because there is nothing to import')
+
+    // Cancel must leave the DB untouched.
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn'))
+        .find((x) => x.textContent.trim() === '取消')
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 400))
+    assert.match(await p.evaluate(() => document.body.textContent), /已取消导入/)
+    const count = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      return (await dbmod.snapshotDb(dbmod.db)).records.length
+    })
+    assert.equal(count, 0, 'cancel writes nothing')
     await ctx.close()
   })
 
@@ -884,7 +994,8 @@ test('browser E2E', async (t) => {
 
     const body = await p.evaluate(() => document.body.textContent)
     assert.match(body, /旧版备份/, 'legacy backup is identified')
-    assert.match(body, /无法确认题目是否一致/, 'risk is stated')
+    assert.match(body, /无法整体校验题库是否一致/, 'the risk is stated')
+    assert.match(body, /逐题按 ID 匹配/, 'the fallback matching rule is explained')
     assert.match(body, /我确认这是旧版备份/, 'an explicit acknowledgement is required')
 
     const disabled = await p.evaluate(() => {
@@ -1073,6 +1184,172 @@ test('browser E2E', async (t) => {
     assert.equal(out.historyForFirst, 1, 'exactly one history row per question')
     assert.equal(out.attempts, 1, 'attempts are not double-counted')
     assert.equal(out.mocks, 1, 'exactly one mock archive row')
+    await ctx.close()
+  })
+
+  // ---- settings persistence after import + reload -------------------------
+
+  await t.test('UI: merge without backup settings KEEPS current settings (and survives reload)', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'settings')
+    await p.waitForSelector('.page-title')
+    // Set a distinctive theme, then save it.
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-sm'))
+        .find((b) => b.textContent.includes('深色'))
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 200))
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-primary'))
+        .find((b) => b.textContent.includes('保存设置'))
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 400))
+    assert.equal(await p.evaluate(() => document.documentElement.dataset.theme), 'dark')
+
+    // Import a settings-less backup in MERGE mode.
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      const payload = m.makeExportPayload({
+        settings: undefined,
+        records: [],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
+      })
+      globalThis.__backupText = m.serialize(payload)
+    })
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'no-settings.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    assert.match(
+      await p.evaluate(() => document.body.textContent),
+      /保持当前设置不变/,
+      'the plan states settings are preserved',
+    )
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn'))
+        .find((x) => x.textContent.trim() === '确认导入')
+        ?.click()
+    })
+    await p.waitForFunction(() => document.body.textContent.includes('导入完成'), { timeout: 15000 })
+
+    // REGRESSION: the settings must still be dark, both in the DOM and the DB.
+    assert.equal(await p.evaluate(() => document.documentElement.dataset.theme), 'dark', 'theme preserved after merge')
+    const stored = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      return (await dbmod.snapshotDb(dbmod.db)).settings
+    })
+    assert.equal(stored?.theme, 'dark', 'settings row preserved in the DB')
+
+    // And after a real page reload.
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell', { timeout: 20000 })
+    assert.equal(
+      await p.evaluate(() => document.documentElement.dataset.theme),
+      'dark',
+      'theme survives a page reload after import',
+    )
+    await ctx.close()
+  })
+
+  await t.test('UI: replace without backup settings resets to defaults (and survives reload)', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'settings')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-sm'))
+        .find((b) => b.textContent.includes('深色'))
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 200))
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-primary'))
+        .find((b) => b.textContent.includes('保存设置'))
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 400))
+    assert.equal(await p.evaluate(() => document.documentElement.dataset.theme), 'dark')
+
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      const payload = m.makeExportPayload({
+        settings: undefined,
+        records: [],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
+      })
+      globalThis.__backupText = m.serialize(payload)
+    })
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'no-settings-replace.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    // switch to replace and acknowledge
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn'))
+        .find((x) => x.textContent.includes('替换（清空后写入）'))
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 300))
+    await p.evaluate(() => {
+      document.querySelectorAll('input[type=checkbox]')[0]?.click()
+    })
+    await new Promise((r) => setTimeout(r, 200))
+    assert.match(
+      await p.evaluate(() => document.body.textContent),
+      /重置为默认值/,
+      'the plan states settings will reset',
+    )
+
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn'))
+        .find((x) => x.textContent.trim() === '确认导入')
+        ?.click()
+    })
+    await p.waitForFunction(() => document.body.textContent.includes('导入完成'), { timeout: 15000 })
+
+    const stored = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      return (await dbmod.snapshotDb(dbmod.db)).settings
+    })
+    assert.equal(stored, null, 'settings row cleared for a replace without settings')
+
+    // Reload: the app falls back to the DEFAULTS. DEFAULT_SETTINGS.theme is
+    // 'auto', which resolves from the OS/browser colour scheme — so assert that
+    // the settings ROW is absent and the UI theme equals what 'auto' resolves to
+    // in THIS browser. The point is that the DB and the UI agree after a reload.
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell', { timeout: 20000 })
+    const after = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      const row = await dbmod.db.settings.get('main')
+      return {
+        hasRow: Boolean(row),
+        rowTheme: row ? row.theme : null,
+        domTheme: document.documentElement.dataset.theme,
+        prefersDark: window.matchMedia('(prefers-color-scheme: dark)').matches,
+      }
+    })
+    assert.equal(after.hasRow, false, 'no settings row after a reset restore')
+    assert.equal(
+      after.domTheme,
+      after.prefersDark ? 'dark' : 'light',
+      "the UI theme matches what the default 'auto' setting resolves to",
+    )
     await ctx.close()
   })
 })

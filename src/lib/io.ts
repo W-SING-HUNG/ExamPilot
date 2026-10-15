@@ -523,8 +523,16 @@ export interface ImportPlan {
   mocks: MockRun[]
   aiReviews: AiReview[]
   settings: AppSettings | null
-  /** true when settings will be written (and, in replace mode, cleared first) */
-  settingsWritten: boolean
+  /**
+   * Explicit settings semantics handed to the database layer, so the actual
+   * write always matches what the UI promised:
+   *  - 'keep'  → merge mode with no usable backup settings; current settings stay
+   *  - 'set'   → the backup carries valid settings; they replace the current ones
+   *  - 'reset' → replace mode with no usable backup settings; falls back to defaults
+   */
+  settingsAction: 'keep' | 'set' | 'reset'
+  /** Which rows were excluded because their question is absent from the bank. */
+  filter: BankFilterReport
 }
 
 /** Row-level difference between the backup and the current database. */
@@ -553,6 +561,68 @@ export interface BankCheck {
   unmatchedHistory: number
   mocksWithUnmatchedQuestions: number
   message: string
+}
+
+/**
+ * Report produced by filtering a backup down to rows whose question id exists in
+ * the current bank.
+ *
+ * Question ids are content-derived (the parser embeds a hash of the stem), so an
+ * id that exists in the current bank is itself per-question identity evidence:
+ * the same id means the same question–option–answer binding. Rows whose id is
+ * absent cannot be verified and are therefore excluded rather than imported.
+ */
+export interface BankFilterReport {
+  applied: boolean
+  excludedRecords: number
+  excludedHistory: number
+  excludedMocks: number
+  excludedAiReviews: number
+  keptRecords: number
+  keptHistory: number
+  keptMocks: number
+  keptAiReviews: number
+  /**
+   * True when the backup DID contain data but none of it could be verified
+   * against the current bank. An entirely empty backup is not "unverifiable" —
+   * restoring nothing is a legitimate operation.
+   */
+  nothingVerifiable: boolean
+}
+
+/**
+ * Keep only rows that reference a question present in the current bank.
+ *
+ * A mock is kept only when EVERY question it references exists, because dropping
+ * individual submissions would silently change that exam's score.
+ */
+export function filterPayloadToBank(
+  payload: ExportPayload,
+  bankQuestionIds: Set<string>,
+): { payload: ExportPayload; report: BankFilterReport } {
+  const records = payload.records.filter((r) => bankQuestionIds.has(r.qid))
+  const history = payload.history.filter((h) => bankQuestionIds.has(h.qid))
+  const aiReviews = payload.aiReviews.filter((a) => bankQuestionIds.has(a.qid))
+  const mocks = payload.mocks.filter((m) => Object.keys(m.submissions ?? {}).every((qid) => bankQuestionIds.has(qid)))
+
+  const totalIn = payload.records.length + payload.history.length + payload.mocks.length + payload.aiReviews.length
+
+  const report: BankFilterReport = {
+    applied: true,
+    excludedRecords: payload.records.length - records.length,
+    excludedHistory: payload.history.length - history.length,
+    excludedMocks: payload.mocks.length - mocks.length,
+    excludedAiReviews: payload.aiReviews.length - aiReviews.length,
+    keptRecords: records.length,
+    keptHistory: history.length,
+    keptMocks: mocks.length,
+    keptAiReviews: aiReviews.length,
+    // Only a NON-EMPTY backup whose every row was excluded counts as unverifiable.
+    nothingVerifiable:
+      totalIn > 0 && records.length === 0 && history.length === 0 && mocks.length === 0 && aiReviews.length === 0,
+  }
+
+  return { payload: { ...payload, records, history, mocks, aiReviews }, report }
 }
 
 /**
@@ -593,16 +663,40 @@ export function checkBank(
   return { status, unmatchedRecords, unmatchedHistory, mocksWithUnmatchedQuestions, message }
 }
 
-/** Build the concrete write plan for a restore. */
-export function planImport(payload: ExportPayload, mode: RestoreMode, existing?: ExistingData): ImportPlan {
-  const incomingRecords = payload.records ?? []
-  const incomingHistory = payload.history ?? []
-  const incomingMocks = payload.mocks ?? []
-  const incomingAi = payload.aiReviews ?? []
+/**
+ * Build the concrete write plan for a restore.
+ *
+ * Every row is first filtered against the current bank: a question id that
+ * exists in the current bank is per-question identity evidence (ids are derived
+ * from question content), so those rows are verifiable. Rows whose id is absent
+ * cannot be verified and are EXCLUDED — they never reach the learning statistics.
+ * The exclusion is reported in `plan.filter` so the UI can explain it.
+ *
+ * Settings semantics (the plan's `settingsAction` is what the DB actually does):
+ *  - backup has valid settings  -> 'set'   (both modes)
+ *  - replace without settings   -> 'reset' (fall back to DEFAULT_SETTINGS)
+ *  - merge without settings     -> 'keep'  (current settings are preserved)
+ */
+export function planImport(
+  payload: ExportPayload,
+  mode: RestoreMode,
+  existing?: ExistingData,
+  bankQuestionIds?: Set<string>,
+): ImportPlan {
+  const { payload: verified, report } = bankQuestionIds
+    ? filterPayloadToBank(payload, bankQuestionIds)
+    : { payload, report: emptyFilterReport() }
+
+  const incomingRecords = verified.records ?? []
+  const incomingHistory = verified.history ?? []
+  const incomingMocks = verified.mocks ?? []
+  const incomingAi = verified.aiReviews ?? []
 
   const issues: ValidationIssue[] = []
   const settings = validateSettings(payload.settings, 'settings', issues)
-  const settingsValid = issues.length === 0
+  const settingsUsable = issues.length === 0 && settings !== null
+
+  const action: ImportPlan['settingsAction'] = settingsUsable ? 'set' : mode === 'replace' ? 'reset' : 'keep'
 
   if (mode === 'replace' || !existing) {
     return {
@@ -610,8 +704,9 @@ export function planImport(payload: ExportPayload, mode: RestoreMode, existing?:
       history: incomingHistory,
       mocks: incomingMocks,
       aiReviews: incomingAi,
-      settings: settingsValid ? settings : null,
-      settingsWritten: settingsValid && settings !== null,
+      settings: settingsUsable ? settings : null,
+      settingsAction: action,
+      filter: report,
     }
   }
 
@@ -632,13 +727,34 @@ export function planImport(payload: ExportPayload, mode: RestoreMode, existing?:
     history: byId(existing.history, incomingHistory),
     mocks: byId(existing.mocks, incomingMocks),
     aiReviews: byId(existing.aiReviews, incomingAi),
-    settings: settingsValid ? settings : null,
-    settingsWritten: settingsValid && settings !== null,
+    settings: settingsUsable ? settings : null,
+    settingsAction: action,
+    filter: report,
   }
 }
 
-/** Row-level diff used by the confirmation UI. */
-export function diffImport(payload: ExportPayload, mode: RestoreMode, existing: ExistingData): ImportDiff {
+function emptyFilterReport(): BankFilterReport {
+  return {
+    applied: false,
+    excludedRecords: 0,
+    excludedHistory: 0,
+    excludedMocks: 0,
+    excludedAiReviews: 0,
+    keptRecords: 0,
+    keptHistory: 0,
+    keptMocks: 0,
+    keptAiReviews: 0,
+    nothingVerifiable: false,
+  }
+}
+
+/**
+ * Row-level diff used by the confirmation UI.
+ *
+ * Takes the already-filtered `ImportPlan`, so the numbers shown to the user are
+ * exactly the rows that will be written (never the raw backup size).
+ */
+export function diffImport(plan: ImportPlan, mode: RestoreMode, existing: ExistingData): ImportDiff {
   const stat = <T>(incoming: T[], current: T[], key: (x: T) => string) => {
     const cur = new Set(current.map(key))
     const inc = new Set(incoming.map(key))
@@ -650,10 +766,10 @@ export function diffImport(payload: ExportPayload, mode: RestoreMode, existing: 
     }
     return { incoming: incoming.length, existing: current.length, added, updated }
   }
-  const issues: ValidationIssue[] = []
-  const incomingSettings = validateSettings(payload.settings, 'settings', issues)
+
+  const incomingSettings = plan.settings
   const settingsChanged =
-    issues.length === 0 &&
+    plan.settingsAction === 'set' &&
     incomingSettings !== null &&
     JSON.stringify(incomingSettings) !== JSON.stringify(existing.settings ?? null)
 
@@ -663,10 +779,10 @@ export function diffImport(payload: ExportPayload, mode: RestoreMode, existing: 
       : 0
 
   return {
-    records: stat(payload.records ?? [], existing.records, (r) => r.qid),
-    history: stat(payload.history ?? [], existing.history, (h) => h.id),
-    mocks: stat(payload.mocks ?? [], existing.mocks, (m) => m.id),
-    aiReviews: stat(payload.aiReviews ?? [], existing.aiReviews, (a) => a.id),
+    records: stat(plan.records, existing.records, (r) => r.qid),
+    history: stat(plan.history, existing.history, (h) => h.id),
+    mocks: stat(plan.mocks, existing.mocks, (m) => m.id),
+    aiReviews: stat(plan.aiReviews, existing.aiReviews, (a) => a.id),
     settingsChanged,
     clearedInReplace,
   }
@@ -674,13 +790,15 @@ export function diffImport(payload: ExportPayload, mode: RestoreMode, existing: 
 
 /** Human-readable summary of what a restore will do. */
 export function describePlan(plan: ImportPlan, mode: RestoreMode): string[] {
+  const settingsLine =
+    plan.settingsAction === 'set'
+      ? '偏好设置：将使用备份中的设置'
+      : plan.settingsAction === 'reset'
+        ? '偏好设置：备份未包含有效设置，将重置为默认值'
+        : '偏好设置：保持当前设置不变'
   return [
     `模式：${mode === 'replace' ? '替换（清空现有数据后写入备份）' : '合并（同一 ID 以备份为准）'}`,
     `将写入：学习记录 ${plan.records.length} 条 · 历史 ${plan.history.length} 条 · 模拟考试 ${plan.mocks.length} 场 · AI 评阅 ${plan.aiReviews.length} 条`,
-    plan.settingsWritten
-      ? '偏好设置：将使用备份中的设置'
-      : mode === 'replace'
-        ? '偏好设置：备份未包含有效设置，将重置为默认值'
-        : '偏好设置：保持当前设置不变',
+    settingsLine,
   ]
 }

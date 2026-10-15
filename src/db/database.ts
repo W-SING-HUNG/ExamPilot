@@ -49,12 +49,24 @@ export async function writeSettings(s: AppSettings): Promise<void> {
   await db.settings.put(row)
 }
 
+/**
+ * How a restore should treat the settings table.
+ *
+ *  - `keep`  — leave the existing settings untouched (merge with no backup settings)
+ *  - `set`   — replace settings with `settings`
+ *  - `reset` — clear the table so the app falls back to DEFAULT_SETTINGS
+ *              (replace with no usable settings in the backup)
+ */
+export type SettingsAction = 'keep' | 'set' | 'reset'
+
 export interface RestoreInput {
   records: QRecord[]
   history: HistoryEntry[]
   mocks: MockRun[]
   aiReviews: AiReview[]
-  /** optional: when omitted the settings table is left cleared */
+  /** Explicit settings semantics; defaults to 'keep' so nothing is lost silently. */
+  settingsAction?: SettingsAction
+  /** required when settingsAction === 'set' */
   settings?: AppSettings | null
 }
 
@@ -65,14 +77,18 @@ export interface RestoreInput {
  * table keeps its previous content, so a failed import cannot leave a
  * half-restored database. Returns the number of rows written per table.
  *
- * The settings table is ALWAYS cleared first, so a "replace" restore never
- * silently keeps stale settings while reporting success.
+ * Settings are handled according to `settingsAction` so the database always
+ * matches what the UI reported to the user:
+ *  - 'keep'  → the settings row is not touched at all
+ *  - 'set'   → the row becomes `settings`
+ *  - 'reset' → the row is deleted, so `readSettings()` returns DEFAULT_SETTINGS
  */
 export async function restoreBackupInto(
   target: ExamPilotDB,
   input: RestoreInput,
 ): Promise<{ records: number; history: number; mocks: number; aiReviews: number; settings: number }> {
   const counts = { records: 0, history: 0, mocks: 0, aiReviews: 0, settings: 0 }
+  const action: SettingsAction = input.settingsAction ?? 'keep'
   await target.transaction(
     'rw',
     target.records,
@@ -85,7 +101,21 @@ export async function restoreBackupInto(
       await target.history.clear()
       await target.mocks.clear()
       await target.aiReviews.clear()
-      await target.settings.clear()
+
+      if (action === 'reset') {
+        await target.settings.clear()
+      } else if (action === 'set') {
+        if (input.settings) {
+          await target.settings.put({ ...input.settings, id: 'main' })
+          counts.settings = 1
+        } else {
+          // 'set' without a value is meaningless; behave like reset rather than
+          // leaving a half-applied state.
+          await target.settings.clear()
+        }
+      }
+      // action === 'keep' -> settings table is deliberately left as-is
+
       if (input.records.length) {
         await target.records.bulkPut(input.records)
         counts.records = input.records.length
@@ -101,10 +131,6 @@ export async function restoreBackupInto(
       if (input.aiReviews.length) {
         await target.aiReviews.bulkPut(input.aiReviews)
         counts.aiReviews = input.aiReviews.length
-      }
-      if (input.settings) {
-        await target.settings.put({ ...input.settings, id: 'main' })
-        counts.settings = 1
       }
     },
   )

@@ -1,8 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import 'fake-indexeddb/auto'
-import { createDb, restoreBackupInto, snapshotDb, type ExamPilotDB } from './database'
+import { createDb, restoreBackupInto, snapshotDb, DEFAULT_SETTINGS, type ExamPilotDB } from './database'
 import { makeExportPayload, parseExport, serialize, planImport, bankFingerprint } from '../lib/io'
 import type { QRecord, HistoryEntry, MockRun, AiReview, BankData, Question, AppSettings } from '../lib/types'
+
+/** Read settings from a SPECIFIC database instance (the app's readSettings targets the singleton). */
+async function readSettingsOf(target: ExamPilotDB): Promise<AppSettings> {
+  const row = await target.settings.get('main')
+  return row
+    ? {
+        theme: row.theme,
+        reviewIntervalBase: row.reviewIntervalBase,
+        studyTarget: row.studyTarget,
+        dailyGoalQuestions: row.dailyGoalQuestions,
+      }
+    : { ...DEFAULT_SETTINGS }
+}
 
 /**
  * REAL IndexedDB round-trip test (via fake-indexeddb, which implements the
@@ -131,7 +144,7 @@ async function seed(): Promise<void> {
   await db.settings.put({ ...settings, id: 'main' })
 }
 
-describe('IndexedDB round-trip: export → clear → import → field-by-field compare', () => {
+describe('IndexedDB round-trip: export 閳?clear 閳?import 閳?field-by-field compare', () => {
   it('restores records, history, mocks, aiReviews and settings completely', async () => {
     await seed()
     const before = await snapshotDb(db)
@@ -170,7 +183,8 @@ describe('IndexedDB round-trip: export → clear → import → field-by-field c
       history: plan.history,
       mocks: plan.mocks,
       aiReviews: plan.aiReviews,
-      settings: parsed.payload!.settings as AppSettings,
+      settingsAction: plan.settingsAction,
+      settings: plan.settings,
     })
 
     // every table written
@@ -209,7 +223,7 @@ describe('IndexedDB round-trip: export → clear → import → field-by-field c
     await db.aiReviews.clear()
     await db.settings.clear()
     const plan = planImport(parseExport(serialize(payload)).payload!, 'replace')
-    await restoreBackupInto(db, plan)
+    await restoreBackupInto(db, { ...plan, settingsAction: plan.settingsAction })
     const after = await snapshotDb(db)
 
     // original answers survive
@@ -255,7 +269,7 @@ describe('IndexedDB round-trip: export → clear → import → field-by-field c
       mocks: before.mocks,
       aiReviews: before.aiReviews,
     })
-    await restoreBackupInto(db, plan)
+    await restoreBackupInto(db, { ...plan, settingsAction: plan.settingsAction })
     const after = await snapshotDb(db)
     expect(after.records.map((r) => r.qid).sort()).toEqual(['q1', 'q2', 'q3', 'q9'])
     expect(after.history).toHaveLength(4)
@@ -288,5 +302,121 @@ describe('IndexedDB transaction atomicity', () => {
     expect(after.mocks).toHaveLength(before.mocks.length)
     expect(after.aiReviews).toHaveLength(before.aiReviews.length)
     expect(after.settings).toEqual(before.settings)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Settings semantics: the DB must do exactly what the plan reported
+// ---------------------------------------------------------------------------
+
+describe('IndexedDB settings semantics', () => {
+  it('REGRESSION: merge with settingsAction=keep PRESERVES the current settings', async () => {
+    await seed()
+    const before = await snapshotDb(db)
+    expect(before.settings).toEqual(settings)
+
+    // A merge whose backup carries no usable settings.
+    const plan = planImport(
+      makeExportPayload({
+        settings: undefined,
+        records: [],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: bankFingerprint(bank),
+        bankCount: 4,
+      }),
+      'merge',
+      { ...before },
+    )
+    expect(plan.settingsAction).toBe('keep')
+
+    await restoreBackupInto(db, {
+      records: plan.records,
+      history: plan.history,
+      mocks: plan.mocks,
+      aiReviews: plan.aiReviews,
+      settingsAction: plan.settingsAction,
+      settings: plan.settings,
+    })
+
+    // Settings must be UNCHANGED 鈥?this is the behaviour the old unconditional
+    // clear broke.
+    expect((await snapshotDb(db)).settings).toEqual(settings)
+    expect((await readSettingsOf(db)).theme).toBe('dark')
+  })
+
+  it('REGRESSION: replace with settingsAction=reset falls back to DEFAULT_SETTINGS', async () => {
+    await seed()
+    const before = await snapshotDb(db)
+    const plan = planImport(
+      makeExportPayload({
+        settings: undefined,
+        records: [],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: bankFingerprint(bank),
+        bankCount: 4,
+      }),
+      'replace',
+      { ...before },
+    )
+    expect(plan.settingsAction).toBe('reset')
+
+    await restoreBackupInto(db, {
+      records: plan.records,
+      history: plan.history,
+      mocks: plan.mocks,
+      aiReviews: plan.aiReviews,
+      settingsAction: plan.settingsAction,
+      settings: plan.settings,
+    })
+
+    expect((await snapshotDb(db)).settings).toBe(null)
+    // readSettings() is what the UI uses, so it must report the defaults.
+    expect(await readSettingsOf(db)).toEqual(DEFAULT_SETTINGS)
+  })
+
+  it('replace with settingsAction=set writes the backup settings', async () => {
+    await seed()
+    const next: AppSettings = { theme: 'light', reviewIntervalBase: 3, studyTarget: 10, dailyGoalQuestions: 5 }
+    await restoreBackupInto(db, {
+      records: [],
+      history: [],
+      mocks: [],
+      aiReviews: [],
+      settingsAction: 'set',
+      settings: next,
+    })
+    expect(await readSettingsOf(db)).toEqual(next)
+  })
+
+  it('the settings row survives a simulated page reload (fresh read)', async () => {
+    await seed()
+    // A reload re-reads settings from IndexedDB; the value must be identical.
+    const readAfterReload = await readSettingsOf(db)
+    expect(readAfterReload).toEqual(settings)
+  })
+
+  it('a failure during a settings restore rolls the whole restore back', async () => {
+    await seed()
+    const before = await snapshotDb(db)
+
+    const badRecords = [{ ...rec('qNew', 1), qid: undefined } as unknown as QRecord]
+    await expect(
+      restoreBackupInto(db, {
+        records: badRecords,
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        settingsAction: 'reset',
+      }),
+    ).rejects.toBeTruthy()
+
+    const after = await snapshotDb(db)
+    // settings were NOT reset, because the transaction aborted
+    expect(after.settings).toEqual(before.settings)
+    expect(after.records).toHaveLength(before.records.length)
   })
 })

@@ -438,9 +438,7 @@ export function MockExam({
                         >
                           {aiQid === qq.id ? '收起 AI 评阅' : 'AI 参考评阅'}
                         </button>
-                        {aiQid === qq.id && (
-                          <AiGradePanel q={qq} userAnswer={mine ?? ''} sessionId={`mock-${result.id}`} />
-                        )}
+                        {aiQid === qq.id && <AiGradePanel q={qq} userAnswer={mine ?? ''} sessionId={result.id} />}
                       </>
                     )}
                   </div>

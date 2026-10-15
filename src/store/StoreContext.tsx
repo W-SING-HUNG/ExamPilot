@@ -1,9 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { db, restoreBackupInto } from '../db/database'
+import { db, restoreBackupInto, DEFAULT_SETTINGS } from '../db/database'
 import type { QRecord, HistoryEntry, MockRun, AiReview, AppSettings, AiGradeResult, MockConfig } from '../lib/types'
 import { freshRecord, applyAttempt } from '../lib/scheduler'
 import { scoreAnswer, isAnswerBlank } from '../lib/scoring'
-import { submitMockRun as submitMockRunTx, saveAiReviewWithAttempt } from '../lib/session'
+import { submitMockRun as submitMockRunTx, saveAiReviewWithAttempt, recordAttempt } from '../lib/session'
 import type { Question } from '../lib/types'
 
 export interface SubmitOutcome {
@@ -73,8 +73,9 @@ interface StoreValue {
     history: HistoryEntry[]
     mocks: MockRun[]
     aiReviews: AiReview[]
+    settingsAction: 'keep' | 'set' | 'reset'
     settings: AppSettings | null
-  }) => Promise<void>
+  }) => Promise<{ settings: AppSettings }>
   clearWrong: (qids: string[]) => Promise<void>
 }
 
@@ -168,29 +169,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const saveSubjectiveAttempt = useCallback<StoreValue['saveSubjectiveAttempt']>(
     async (q, answer, mode, sessionId, usedAI = false) => {
-      const now = Date.now()
-      const entry: HistoryEntry = {
-        id: `h-${now}-${q.id}-${Math.random().toString(36).slice(2, 7)}`,
-        qid: q.id,
-        mode,
+      // Same attempt identity as every other path: one attempt per
+      // (sessionId, qid), so a later AI review cannot add a second one, and a
+      // legacy random-id row for the same pair is still recognised.
+      await recordAttempt(db, {
         sessionId,
+        qid: q.id,
         answer,
+        mode,
         isCorrect: null,
-        submittedAt: now,
         usedAI,
-      }
-      // subjective attempts count as "attempted" but never auto-correct
-      await db.transaction('rw', db.records, db.history, async () => {
-        const current = (await db.records.get(q.id)) ?? freshRecord(q.id, now)
-        await db.records.put({
-          ...current,
-          attempts: current.attempts + 1,
-          lastSeenAt: now,
-          lastCorrect: null,
-          lastAnswer: answer,
-          nextReviewAt: now + 24 * 3600 * 1000,
-        })
-        await db.history.add(entry)
       })
       await refresh()
     },
@@ -269,11 +257,39 @@ export function StoreProvider({ children }: { children: ReactNode }) {
        * Full backup restore. All-or-nothing: if any write fails the transaction
        * aborts and the previous data stays intact, so a failed import can never
        * leave a half-restored database.
+       *
+       * React state is reconciled from the DATABASE after the write, so the UI
+       * can never show settings that differ from what was actually persisted.
        */
-      restoreBackup: async ({ records: recs, history: hist, mocks: mks, aiReviews: aiv, settings: s }) => {
-        await restoreBackupInto(db, { records: recs, history: hist, mocks: mks, aiReviews: aiv, settings: s })
-        if (s) setSettings(s)
+      restoreBackup: async ({
+        records: recs,
+        history: hist,
+        mocks: mks,
+        aiReviews: aiv,
+        settingsAction,
+        settings: s,
+      }) => {
+        await restoreBackupInto(db, {
+          records: recs,
+          history: hist,
+          mocks: mks,
+          aiReviews: aiv,
+          settingsAction,
+          settings: s,
+        })
+        // Read the authoritative settings back out of the DB.
+        const persisted = await db.settings.get('main')
+        const next: AppSettings = persisted
+          ? {
+              theme: persisted.theme,
+              reviewIntervalBase: persisted.reviewIntervalBase,
+              studyTarget: persisted.studyTarget,
+              dailyGoalQuestions: persisted.dailyGoalQuestions,
+            }
+          : { ...DEFAULT_SETTINGS }
+        setSettings(next)
         await refresh()
+        return { settings: next }
       },
       clearWrong: async (qids: string[]) => {
         await db.transaction('rw', db.records, db.history, async () => {

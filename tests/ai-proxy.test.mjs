@@ -449,28 +449,32 @@ test('AI proxy: valid grade still succeeds with all fields', async (t) => {
   assert.equal(body.result.maxScore, 100)
 })
 
-// ---- listen-address hardening -------------------------------------------
+// ---- listen-address hardening (loopback only, no remote mode) -------------
 
-test('AI proxy: REFUSES to bind a non-loopback host without AI_ALLOW_REMOTE', async () => {
-  const { code, out } = await spawnProxyExpectingExit({
-    AI_HOST: '0.0.0.0',
-    AI_BASE_URL: '',
-    AI_API_KEY: '',
-    AI_MODEL: '',
-  })
-  assert.equal(code, 1, 'must exit non-zero instead of exposing the proxy')
-  assert.match(out, /拒绝启动/)
-  assert.match(out, /AI_ALLOW_REMOTE/)
+test('AI proxy: REFUSES a non-loopback host outright', async () => {
+  for (const host of ['0.0.0.0', '192.168.1.10', '::']) {
+    const { code, out } = await spawnProxyExpectingExit({
+      AI_HOST: host,
+      AI_BASE_URL: '',
+      AI_API_KEY: '',
+      AI_MODEL: '',
+    })
+    assert.equal(code, 1, `host ${host} must be refused instead of exposing the proxy`)
+    assert.match(out, /拒绝启动/)
+    assert.match(out, /回环地址/)
+  }
 })
 
-test('AI proxy: REFUSES remote mode without a config token', async () => {
+test('AI proxy: there is NO override flag that enables remote binding', async () => {
+  // Previously AI_ALLOW_REMOTE=1 (plus a token) permitted a network bind. That
+  // escape hatch is gone: the proxy must refuse regardless.
   const { code, out } = await spawnProxyExpectingExit({
     AI_HOST: '0.0.0.0',
     AI_ALLOW_REMOTE: '1',
-    AI_CONFIG_TOKEN: '',
+    AI_CONFIG_TOKEN: 'shared-secret',
   })
-  assert.equal(code, 1, 'remote mode without a token must be refused')
-  assert.match(out, /AI_CONFIG_TOKEN/)
+  assert.equal(code, 1, 'remote binding must be impossible even with the legacy flags')
+  assert.match(out, /拒绝启动/)
 })
 
 test('AI proxy: loopback host still starts normally', async (t) => {
@@ -481,9 +485,23 @@ test('AI proxy: loopback host still starts normally', async (t) => {
   assert.equal(r.status, 200)
 })
 
-test('AI proxy: config write requires the shared token when remote mode is on', async (t) => {
-  // Bind loopback but enable the token requirement: without the token the write
-  // must be refused, and with it the write succeeds.
+test('AI proxy: quota-spending endpoints are reachable from loopback (offline-safe)', async (t) => {
+  // Unconfigured: QA/grade must still answer with ok:false rather than an auth
+  // error, proving the loopback guard does not block the normal local flow.
+  await startProxy({ AI_HOST: '127.0.0.1' })
+  t.after(stopProxy)
+  for (const path of ['/api/ai/qa', '/api/ai/grade']) {
+    const r = await fetch(`${BASE}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: { stem: 'x' }, qid: 'q', stem: 'x', userAnswer: '' }),
+    })
+    assert.equal(r.status, 200, `${path} must be reachable locally`)
+    assert.equal((await r.json()).ok, false, `${path} degrades gracefully when unconfigured`)
+  }
+})
+
+test('AI proxy: config write requires the shared token when one is configured', async (t) => {
   await startProxy({ AI_HOST: '127.0.0.1', AI_CONFIG_TOKEN: 'shared-secret' })
   t.after(stopProxy)
 

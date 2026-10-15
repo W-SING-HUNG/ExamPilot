@@ -22,22 +22,104 @@ export interface SubmitMockResult {
 }
 
 /**
- * Deterministic history id for one answered question inside one exam run.
+ * Deterministic history id for one attempt at one question inside one session.
  *
- * Because the id is a pure function of (runId, qid), replaying the same run
- * cannot insert a second row for the same question — the primary key collides
- * and the transaction overwrites instead of duplicating.
+ * The identity of an attempt is (sessionId, qid): answering or reviewing the same
+ * question inside the same session is ONE training attempt. The id is a pure
+ * function of those inputs, so a re-entry updates the existing row instead of
+ * inserting a second one.
+ *
+ * NOTE ON LEGACY DATA: history rows written by older versions used random ids.
+ * They are never deleted or recomputed; `hasAttempt()` below detects them by
+ * scanning (qid, sessionId) so no new attempt is added on top of them.
  */
-export function historyIdFor(runId: string, qid: string): string {
-  return `h-mock-${runId}-${qid}`
+export function attemptIdFor(sessionId: string, qid: string): string {
+  return `h-att-${sessionId}-${qid}`
+}
+
+/** Deterministic id of the mock archive row for one exam run. */
+export function mockRunIdFor(runId: string): string {
+  return runId
 }
 
 /**
  * Deterministic AI-review id for one question inside one session, so pressing
- * "AI 评阅" repeatedly updates a single record instead of adding attempts.
+ * "AI 璇勯槄" repeatedly updates a single record instead of adding attempts.
  */
 export function aiReviewIdFor(sessionId: string, qid: string): string {
   return `ai-${sessionId}-${qid}`
+}
+
+/**
+ * True when this session already recorded an attempt at this question.
+ *
+ * Scans by qid and matches the sessionId, so it also finds legacy rows that used
+ * a random id. This is what prevents an AI review from double-counting an attempt
+ * that a practice submission or a mock exam already recorded.
+ */
+export async function hasAttempt(db: ExamPilotDB, sessionId: string, qid: string): Promise<boolean> {
+  const rows = await db.history.where('qid').equals(qid).toArray()
+  return rows.some((h) => h.sessionId === sessionId)
+}
+
+/**
+ * Record ONE training attempt for a question inside a session.
+ *
+ * Idempotent per (sessionId, qid): if any attempt for that pair already exists
+ * (including legacy random-id rows), nothing is added and `created: false` is
+ * returned. The learning record is only advanced when a new attempt is created.
+ */
+export async function recordAttempt(
+  db: ExamPilotDB,
+  input: {
+    sessionId: string
+    qid: string
+    answer: string
+    mode: string
+    isCorrect: boolean | null
+    usedAI: boolean
+    now?: number
+  },
+): Promise<{ created: boolean }> {
+  const now = input.now ?? Date.now()
+  let created = false
+
+  await db.transaction('rw', db.records, db.history, async () => {
+    if (await hasAttempt(db, input.sessionId, input.qid)) return
+    created = true
+
+    const current = (await db.records.get(input.qid)) ?? freshRecord(input.qid, now)
+    const next: QRecord =
+      input.isCorrect === null
+        ? {
+            ...current,
+            attempts: current.attempts + 1,
+            lastSeenAt: now,
+            lastCorrect: null,
+            lastAnswer: input.answer,
+            nextReviewAt: now + 24 * 3600 * 1000,
+          }
+        : (() => {
+            const applied = applyAttempt(current, input.isCorrect === true, now)
+            applied.lastAnswer = input.answer
+            applied.lastCorrect = input.isCorrect
+            return applied
+          })()
+    await db.records.put(next)
+
+    await db.history.put({
+      id: attemptIdFor(input.sessionId, input.qid),
+      qid: input.qid,
+      mode: input.mode,
+      sessionId: input.sessionId,
+      answer: input.answer,
+      isCorrect: input.isCorrect,
+      submittedAt: now,
+      usedAI: input.usedAI,
+    })
+  })
+
+  return { created }
 }
 
 /**
@@ -45,7 +127,7 @@ export function aiReviewIdFor(sessionId: string, qid: string): string {
  *
  * Guarantees (all covered by fault-injection tests):
  *  1. Everything happens inside ONE Dexie transaction over records/history/mocks,
- *     so a failure anywhere rolls the whole submission back — there is never a
+ *     so a failure anywhere rolls the whole submission back 鈥?there is never a
  *     partially-persisted exam.
  *  2. Progress is computed from records READ INSIDE the transaction, not from a
  *     possibly stale React snapshot.
@@ -59,7 +141,7 @@ export async function submitMockRun(db: ExamPilotDB, input: SubmitMockInput): Pr
   const graded = gradeMockSubmission(paper, submissions, config)
 
   const run: MockRun = {
-    id: runId,
+    id: mockRunIdFor(runId),
     startedAt,
     endedAt,
     config,
@@ -94,7 +176,7 @@ export async function submitMockRun(db: ExamPilotDB, input: SubmitMockInput): Pr
       written.records++
 
       const entry: HistoryEntry = {
-        id: historyIdFor(runId, q.id),
+        id: attemptIdFor(runId, q.id),
         qid: q.id,
         mode: 'mock',
         sessionId: runId,
@@ -121,7 +203,7 @@ export async function submitMockRun(db: ExamPilotDB, input: SubmitMockInput): Pr
       written.records++
 
       const entry: HistoryEntry = {
-        id: historyIdFor(runId, q.id),
+        id: attemptIdFor(runId, q.id),
         qid: q.id,
         mode: 'mock',
         sessionId: runId,
@@ -145,9 +227,13 @@ export async function submitMockRun(db: ExamPilotDB, input: SubmitMockInput): Pr
  *
  * - The AI review row id is deterministic per (sessionId, qid): repeated reviews
  *   update one row instead of accumulating.
- * - The training attempt is likewise keyed by (sessionId, qid) in history, so
- *   clicking "AI 评阅" repeatedly does NOT add repeated attempts. A question
- *   already submitted in this session keeps its original attempt.
+ * - The training attempt is written through the same attempt identity used by
+ *   every other path: `hasAttempt()` scans (qid, sessionId), so it also sees
+ *   attempts written by practice, subjective or mock submission — including
+ *   legacy random-id rows. A question already answered in this session therefore
+ *   keeps its single attempt and the AI review only ADDS an attempt for a
+ *   genuinely new question.
+ * - Both writes share one transaction: a failure leaves neither behind.
  */
 export async function saveAiReviewWithAttempt(
   db: ExamPilotDB,
@@ -161,12 +247,12 @@ export async function saveAiReviewWithAttempt(
     result: AiGradeResult
     now?: number
   },
-): Promise<{ created: boolean }> {
+): Promise<{ created: boolean; attemptCreated: boolean }> {
   const { sessionId, qid, userAnswer, provider, model, result } = input
   const now = input.now ?? Date.now()
   const reviewId = aiReviewIdFor(sessionId, qid)
-  const attemptId = historyIdFor(sessionId, qid)
   let created = false
+  let attemptCreated = false
 
   await db.transaction('rw', db.records, db.history, db.aiReviews, async () => {
     const existing = await db.aiReviews.get(reviewId)
@@ -174,10 +260,9 @@ export async function saveAiReviewWithAttempt(
 
     await db.aiReviews.put({ id: reviewId, qid, userAnswer, createdAt: now, provider, model, result })
 
-    // Only record a training attempt the first time this question is reviewed in
-    // this session; a re-review must not inflate attempts again.
-    const alreadyAttempted = await db.history.get(attemptId)
-    if (!alreadyAttempted) {
+    // Only a genuinely new attempt for this (sessionId, qid) moves the counters.
+    if (!(await hasAttempt(db, sessionId, qid))) {
+      attemptCreated = true
       const current = (await db.records.get(qid)) ?? freshRecord(qid, now)
       await db.records.put({
         ...current,
@@ -188,7 +273,7 @@ export async function saveAiReviewWithAttempt(
         nextReviewAt: now + 24 * 3600 * 1000,
       })
       await db.history.put({
-        id: attemptId,
+        id: attemptIdFor(sessionId, qid),
         qid,
         mode: 'ai-review',
         sessionId,
@@ -200,5 +285,5 @@ export async function saveAiReviewWithAttempt(
     }
   })
 
-  return { created }
+  return { created, attemptCreated }
 }

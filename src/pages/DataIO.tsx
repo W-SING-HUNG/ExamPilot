@@ -24,8 +24,9 @@ import { bank } from '../lib/bank'
  *   1. select a file -> validate -> show a PREVIEW (contents, strategy, diff, risks)
  *   2. the user explicitly confirms -> one transaction writes everything
  *
- * Nothing is written before the user confirms, and a replace restore requires an
- * explicit overwrite acknowledgement.
+ * Nothing is written before the user confirms. Every row is filtered against the
+ * current bank first, so learning progress that cannot be tied to a current
+ * question is never merged into the statistics.
  */
 interface Preview {
   fileName: string
@@ -45,7 +46,6 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
   const [mode, setMode] = useState<RestoreMode>('merge')
   const [preview, setPreview] = useState<Preview | null>(null)
   const [overwriteAck, setOverwriteAck] = useState(false)
-  const [mismatchAck, setMismatchAck] = useState(false)
   const [legacyAck, setLegacyAck] = useState(false)
 
   const currentData = () => ({
@@ -55,6 +55,8 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
     aiReviews,
     settings,
   })
+
+  const bankIds = () => new Set(bank.questions.map((q) => q.id))
 
   const exportAll = () => {
     const payload = makeExportPayload({
@@ -85,13 +87,27 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
     toast('已导出题库数据')
   }
 
+  const buildPreview = (fileName: string, payload: ExportPayload, warnings: string[], m: RestoreMode): Preview => {
+    const existing = currentData()
+    const ids = bankIds()
+    const bankCheck = checkBank(payload, bankFingerprint(bank), bank.questions.length, ids)
+    const plan = planImport(payload, m, existing, ids)
+    return {
+      fileName,
+      payload,
+      diff: diffImport(plan, m, existing),
+      bankCheck,
+      plan,
+      warnings,
+    }
+  }
+
   /** Step 1: validate and build a preview. Writes NOTHING. */
   const onFile = async (f: File) => {
     setBusy(true)
     setMsg([])
     setPreview(null)
     setOverwriteAck(false)
-    setMismatchAck(false)
     setLegacyAck(false)
     try {
       const text = await f.text()
@@ -100,22 +116,7 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
         setMsg(['导入失败：备份未通过校验，未写入任何数据。', ...res.errors.slice(0, 8)])
         return
       }
-      const payload = res.payload
-      const existing = currentData()
-      const bankCheck = checkBank(
-        payload,
-        bankFingerprint(bank),
-        bank.questions.length,
-        new Set(bank.questions.map((q) => q.id)),
-      )
-      setPreview({
-        fileName: f.name,
-        payload,
-        diff: diffImport(payload, mode, existing),
-        bankCheck,
-        plan: planImport(payload, mode, existing),
-        warnings: res.warnings,
-      })
+      setPreview(buildPreview(f.name, res.payload, res.warnings, mode))
     } catch (e) {
       setMsg([`导入失败：${(e as Error).message}`, '未写入任何数据。'])
     } finally {
@@ -128,12 +129,7 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
     setMode(m)
     setOverwriteAck(false)
     if (!preview) return
-    const existing = currentData()
-    setPreview({
-      ...preview,
-      diff: diffImport(preview.payload, m, existing),
-      plan: planImport(preview.payload, m, existing),
-    })
+    setPreview(buildPreview(preview.fileName, preview.payload, preview.warnings, m))
   }
 
   const cancelPreview = () => {
@@ -148,10 +144,6 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
       setMsg(['替换模式会清空现有学习数据，请先勾选确认。'])
       return
     }
-    if (preview.bankCheck.status === 'mismatch' && !mismatchAck) {
-      setMsg(['题库指纹不一致，请先确认你了解风险。'])
-      return
-    }
     if (preview.bankCheck.status === 'unknown' && !legacyAck) {
       setMsg(['旧版备份缺少题库指纹，请先确认你了解风险。'])
       return
@@ -159,14 +151,19 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
     setBusy(true)
     try {
       const { plan } = preview
-      await restoreBackup({
+      const out = await restoreBackup({
         records: plan.records,
         history: plan.history,
         mocks: plan.mocks,
         aiReviews: plan.aiReviews,
+        settingsAction: plan.settingsAction,
         settings: plan.settings,
       })
-      setMsg(['导入完成：学习记录、历史、模拟考试、AI 评阅与偏好设置已按所选策略恢复。', ...describePlan(plan, mode)])
+      setMsg([
+        '导入完成：学习记录、历史、模拟考试、AI 评阅与偏好设置已按所选策略恢复。',
+        ...describePlan(plan, mode),
+        `当前偏好设置：主题 ${out.settings.theme} · 每日目标 ${out.settings.dailyGoalQuestions} 题`,
+      ])
       setPreview(null)
       toast('导入完成')
     } catch (e) {
@@ -178,11 +175,11 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
 
   if (!ready) return null
 
-  const needsAck =
-    (mode === 'replace' && !overwriteAck) ||
-    (preview?.bankCheck.status === 'mismatch' && !mismatchAck) ||
-    (preview?.bankCheck.status === 'unknown' && !legacyAck) ||
-    Boolean(preview && preview.bankCheck.unmatchedRecords + preview.bankCheck.unmatchedHistory > 0)
+  const f = preview?.plan.filter
+  const excludedTotal = f ? f.excludedRecords + f.excludedHistory + f.excludedMocks + f.excludedAiReviews : 0
+  const nothingToImport = f ? f.nothingVerifiable : false
+  const needsLegacyAck = preview?.bankCheck.status === 'unknown' && !legacyAck
+  const confirmBlocked = (mode === 'replace' && !overwriteAck) || needsLegacyAck || nothingToImport
 
   return (
     <>
@@ -248,8 +245,8 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
             type="file"
             accept=".json,application/json"
             onChange={(e) => {
-              const f = e.target.files?.[0]
-              if (f) void onFile(f)
+              const file = e.target.files?.[0]
+              if (file) void onFile(file)
               e.target.value = ''
             }}
           />
@@ -287,21 +284,31 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
             {preview.bankCheck.message}
           </div>
 
-          {preview.bankCheck.status === 'mismatch' && (
+          {nothingToImport && (
             <div className="result-banner bad" style={{ marginBottom: 10 }}>
-              备份来自不同的题库。恢复后这些记录无法对应到当前题目，会污染覆盖率与正确率统计。系统不会自动执行恢复 ——
-              请确认你了解风险后再继续。
+              这份备份中没有任何数据能对应到当前题库，因此<b>没有可导入的内容</b>。
+              为避免把无法验证题目—答案绑定的进度计入统计，系统不会写入任何数据。 请确认是否选错了题库版本或备份文件。
+            </div>
+          )}
+
+          {preview.bankCheck.status === 'mismatch' && !nothingToImport && (
+            <div className="result-banner warn" style={{ marginBottom: 10 }}>
+              备份来自不同的题库。学习进度只在<b>题目 ID 能在当前题库中逐题匹配</b>时才会导入；
+              无法匹配的条目会被排除，不会混入覆盖率与正确率统计。
             </div>
           )}
           {preview.bankCheck.status === 'unknown' && (
             <div className="result-banner warn" style={{ marginBottom: 10 }}>
-              这是旧版备份（缺少题库指纹），无法确认题目是否一致。请确认后再继续。
+              这是旧版备份（缺少题库指纹），无法整体校验题库是否一致。系统仍会逐题按 ID 匹配，
+              只导入能对应到当前题库的条目。请确认后再继续。
             </div>
           )}
-          {preview.bankCheck.unmatchedRecords + preview.bankCheck.unmatchedHistory > 0 && (
+
+          {excludedTotal > 0 && !nothingToImport && (
             <div className="result-banner warn" style={{ marginBottom: 10 }}>
-              备份中有 {preview.bankCheck.unmatchedRecords} 条学习记录、
-              {preview.bankCheck.unmatchedHistory} 条历史记录的题目不在当前题库中。这些条目无法可靠匹配，请谨慎继续。
+              已排除 {excludedTotal} 条无法匹配当前题库的数据： 学习记录 {f?.excludedRecords}、历史 {f?.excludedHistory}
+              、 模拟考试 {f?.excludedMocks}、AI 评阅 {f?.excludedAiReviews}。
+              这些条目的题目不在当前题库中，无法验证其题目—答案绑定，因此不会写入。
             </div>
           )}
 
@@ -311,6 +318,7 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
                 <tr>
                   <th>数据</th>
                   <th>备份中</th>
+                  <th>可验证</th>
                   <th>现有</th>
                   <th>新增</th>
                   <th>覆盖</th>
@@ -320,14 +328,15 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
               <tbody>
                 {(
                   [
-                    ['学习记录', preview.diff.records],
-                    ['练习历史', preview.diff.history],
-                    ['模拟考试', preview.diff.mocks],
-                    ['AI 评阅', preview.diff.aiReviews],
+                    ['学习记录', preview.diff.records, f?.excludedRecords ?? 0],
+                    ['练习历史', preview.diff.history, f?.excludedHistory ?? 0],
+                    ['模拟考试', preview.diff.mocks, f?.excludedMocks ?? 0],
+                    ['AI 评阅', preview.diff.aiReviews, f?.excludedAiReviews ?? 0],
                   ] as const
-                ).map(([label, d]) => (
+                ).map(([label, d, excluded]) => (
                   <tr key={label}>
                     <td>{label}</td>
+                    <td>{d.incoming + excluded}</td>
                     <td>{d.incoming}</td>
                     <td>{d.existing}</td>
                     <td>{d.added}</td>
@@ -364,27 +373,23 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
               <span className="muted">我确认要用备份替换现有全部学习数据（现有数据将被删除，且不可撤销）</span>
             </label>
           )}
-          {preview.bankCheck.status === 'mismatch' && (
-            <label className="row" style={{ gap: 8, marginBottom: 8 }}>
-              <input type="checkbox" checked={mismatchAck} onChange={(e) => setMismatchAck(e.target.checked)} />
-              <span className="muted">我确认题库不一致，仍要导入（可能导致统计失真）</span>
-            </label>
-          )}
           {preview.bankCheck.status === 'unknown' && (
             <label className="row" style={{ gap: 8, marginBottom: 8 }}>
               <input type="checkbox" checked={legacyAck} onChange={(e) => setLegacyAck(e.target.checked)} />
-              <span className="muted">我确认这是旧版备份，无法校验题库一致性，仍要导入</span>
+              <span className="muted">我确认这是旧版备份，无法整体校验题库一致性，仍要按 ID 逐题导入</span>
             </label>
           )}
 
           <div className="btn-row">
-            <button className="btn btn-primary" onClick={confirmImport} disabled={busy || needsAck}>
+            <button className="btn btn-primary" onClick={confirmImport} disabled={busy || confirmBlocked}>
               确认导入
             </button>
             <button className="btn" onClick={cancelPreview} disabled={busy}>
               取消
             </button>
-            {needsAck && <span className="muted-2">请先完成上方确认项</span>}
+            {mode === 'replace' && !overwriteAck && <span className="muted-2">请先勾选替换确认</span>}
+            {needsLegacyAck && <span className="muted-2">请先勾选旧版备份风险确认</span>}
+            {nothingToImport && <span className="muted-2">没有可导入的数据</span>}
           </div>
         </CardPad>
       )}
@@ -393,7 +398,9 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
         <div className="card-title">数据说明</div>
         <ul className="muted" style={{ margin: 0, paddingLeft: 20, lineHeight: 2 }}>
           <li>备份包含学习记录、练习历史、模拟考试成绩、AI 评阅与偏好设置，并附带题库指纹用于一致性校验。</li>
-          <li>题目数据来自指定题库来源，题干、选项、答案与章节均按原文解析，未做事实修改。</li>
+          <li>题目 ID 由题目内容生成，因此「ID 能在当前题库中找到」即证明题目—选项—答案绑定一致。</li>
+          <li>导入时会逐题按 ID 匹配，题目不在当前题库中的记录会被排除，不会计入覆盖率与正确率。</li>
+          <li>模拟考试只有在全部题目都能匹配时才会导入，避免因部分题目缺失而改变该场成绩。</li>
           <li>
             简答题与材料分析论述题在题库中只有题干、没有标准答案，系统不伪造官方答案；AI
             评阅结果会单独保存并标注为参考评阅。
