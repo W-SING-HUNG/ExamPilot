@@ -610,8 +610,8 @@ export function filterPayloadToBank(
   const records = fingerprintMatch ? payload.records.filter((r) => bankQuestionIds.has(r.qid)) : []
   const history = fingerprintMatch ? payload.history.filter((h) => bankQuestionIds.has(h.qid)) : []
   const aiReviews = payload.aiReviews.filter((a) => bankQuestionIds.has(a.qid))
-  const mocks = payload.mocks.filter((m) =>
-    fingerprintMatch && Object.keys(m.submissions ?? {}).every((qid) => bankQuestionIds.has(qid)),
+  const mocks = payload.mocks.filter(
+    (m) => fingerprintMatch && Object.keys(m.submissions ?? {}).every((qid) => bankQuestionIds.has(qid)),
   )
 
   const totalIn = payload.records.length + payload.history.length + payload.mocks.length + payload.aiReviews.length

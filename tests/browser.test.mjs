@@ -828,73 +828,76 @@ test('browser E2E', async (t) => {
     await ctx.close()
   })
 
-  await t.test('UI: fingerprint mismatch blocks progress migration to prevent wrong-question misattribution', async () => {
-    const { p, ctx } = await freshPage()
-    await nav(p, 'io')
-    await p.waitForSelector('.page-title')
-    // A backup from a DIFFERENT bank that references one current question id
-    // Because bank fingerprint does not match, learning progress cannot guarantee
-    // option/answer binding consistency, so it is safely excluded.
-    await p.evaluate(async () => {
-      const m = await import('/src/lib/io.ts')
-      const bankMod = await import('/src/lib/bank.ts')
-      const realId = bankMod.allQuestions[0].id
-      globalThis.__realId = realId
-      const payload = m.makeExportPayload({
-        settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
-        records: [
-          {
-            qid: realId,
-            status: 'learning',
-            attempts: 2,
-            correctCount: 1,
-            wrongCount: 1,
-            lastSeenAt: 1,
-            lastCorrect: false,
-            lastAnswer: 'A',
-            intervalDays: 1,
-            ease: 2,
-            nextReviewAt: 1,
-          },
-        ],
-        history: [],
-        mocks: [],
-        aiReviews: [],
-        bankFingerprint: 'a-completely-different-bank-fingerprint',
-        bankCount: 17,
+  await t.test(
+    'UI: fingerprint mismatch blocks progress migration to prevent wrong-question misattribution',
+    async () => {
+      const { p, ctx } = await freshPage()
+      await nav(p, 'io')
+      await p.waitForSelector('.page-title')
+      // A backup from a DIFFERENT bank that references one current question id
+      // Because bank fingerprint does not match, learning progress cannot guarantee
+      // option/answer binding consistency, so it is safely excluded.
+      await p.evaluate(async () => {
+        const m = await import('/src/lib/io.ts')
+        const bankMod = await import('/src/lib/bank.ts')
+        const realId = bankMod.allQuestions[0].id
+        globalThis.__realId = realId
+        const payload = m.makeExportPayload({
+          settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
+          records: [
+            {
+              qid: realId,
+              status: 'learning',
+              attempts: 2,
+              correctCount: 1,
+              wrongCount: 1,
+              lastSeenAt: 1,
+              lastCorrect: false,
+              lastAnswer: 'A',
+              intervalDays: 1,
+              ease: 2,
+              nextReviewAt: 1,
+            },
+          ],
+          history: [],
+          mocks: [],
+          aiReviews: [],
+          bankFingerprint: 'a-completely-different-bank-fingerprint',
+          bankCount: 17,
+        })
+        globalThis.__backupText = m.serialize(payload)
       })
-      globalThis.__backupText = m.serialize(payload)
-    })
-    const text = await p.evaluate(() => globalThis.__backupText)
-    await uploadBackup(p, 'mismatch.json', text)
-    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+      const text = await p.evaluate(() => globalThis.__backupText)
+      await uploadBackup(p, 'mismatch.json', text)
+      await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
 
-    const body = await p.evaluate(() => document.body.textContent)
-    assert.match(body, /题库不一致/, 'mismatch is surfaced')
-    assert.match(body, /没有可导入的学习进度|防串题污染/, 'explains why progress cannot be migrated')
+      const body = await p.evaluate(() => document.body.textContent)
+      assert.match(body, /题库不一致/, 'mismatch is surfaced')
+      assert.match(body, /没有可导入的学习进度|防串题污染/, 'explains why progress cannot be migrated')
 
-    // Confirm is blocked because there is no verified data to import
-    const disabled = await p.evaluate(() => {
-      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
-      return b ? b.disabled : null
-    })
-    assert.equal(disabled, true, 'confirm is blocked when fingerprint mismatches without verified bindings')
+      // Confirm is blocked because there is no verified data to import
+      const disabled = await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+        return b ? b.disabled : null
+      })
+      assert.equal(disabled, true, 'confirm is blocked when fingerprint mismatches without verified bindings')
 
-    // Cancel must leave the DB untouched
-    await p.evaluate(() => {
-      Array.from(document.querySelectorAll('.btn'))
-        .find((x) => x.textContent.trim() === '取消')
-        ?.click()
-    })
-    await new Promise((r) => setTimeout(r, 400))
-    const stored = await p.evaluate(async () => {
-      const dbmod = await import('/src/db/database.ts')
-      const snap = await dbmod.snapshotDb(dbmod.db)
-      return { count: snap.records.length }
-    })
-    assert.equal(stored.count, 0, 'database remains clean')
-    await ctx.close()
-  })
+      // Cancel must leave the DB untouched
+      await p.evaluate(() => {
+        Array.from(document.querySelectorAll('.btn'))
+          .find((x) => x.textContent.trim() === '取消')
+          ?.click()
+      })
+      await new Promise((r) => setTimeout(r, 400))
+      const stored = await p.evaluate(async () => {
+        const dbmod = await import('/src/db/database.ts')
+        const snap = await dbmod.snapshotDb(dbmod.db)
+        return { count: snap.records.length }
+      })
+      assert.equal(stored.count, 0, 'database remains clean')
+      await ctx.close()
+    },
+  )
 
   await t.test('UI: a backup with NO verifiable rows explains why nothing can be imported', async () => {
     const { p, ctx } = await freshPage()
@@ -932,7 +935,11 @@ test('browser E2E', async (t) => {
     await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
 
     const body = await p.evaluate(() => document.body.textContent)
-    assert.match(body, /没有可导入的学习进度|没有任何数据能对应到当前题库/, 'the reason is explained, not a silent deadlock')
+    assert.match(
+      body,
+      /没有可导入的学习进度|没有任何数据能对应到当前题库/,
+      'the reason is explained, not a silent deadlock',
+    )
     assert.match(body, /没有可导入的数据|没有可导入的内容/)
 
     const disabled = await p.evaluate(() => {
@@ -1340,61 +1347,68 @@ test('browser E2E', async (t) => {
 
   // ---- Plan session ID stability -------------------------------------------
 
-  await t.test('plan: session ID is generated on session start and remains stable across answers and re-renders', async () => {
-    const { p, ctx } = await freshPage()
-    await nav(p, 'plan')
-    await p.waitForSelector('.page-title')
+  await t.test(
+    'plan: session ID is generated on session start and remains stable across answers and re-renders',
+    async () => {
+      const { p, ctx } = await freshPage()
+      await nav(p, 'plan')
+      await p.waitForSelector('.page-title')
 
-    // Find and click the button to start plan review
-    const started = await p.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button'))
-      const startBtn = btns.find((b) => b.textContent.includes('开始今日复习'))
-      if (startBtn) {
-        startBtn.click()
-        return true
-      }
-      return false
-    })
-
-    if (started) {
-      await p.waitForSelector('.q-stem', { timeout: 10000 })
-      
-      // Select an option
-      await p.evaluate(() => {
-        const opts = document.querySelectorAll('.opt')
-        if (opts.length > 0) {
-          opts[0].click()
-        }
-      })
-
-      // Submit the answer
-      await p.evaluate(() => {
+      // Find and click the button to start plan review
+      const started = await p.evaluate(() => {
         const btns = Array.from(document.querySelectorAll('button'))
-        const submitBtn = btns.find((b) => b.textContent.includes('提交') || b.textContent.includes('确认'))
-        if (submitBtn) submitBtn.click()
-      })
-
-      await new Promise((r) => setTimeout(r, 600))
-
-      // Check IndexedDB history records created for this plan session
-      const historyStats = await p.evaluate(async () => {
-        const dbmod = await import('/src/db/database.ts')
-        const allHistory = await dbmod.db.history.toArray()
-        const planHistory = allHistory.filter((h) => h.mode === 'plan')
-        const sessionIds = Array.from(new Set(planHistory.map((h) => h.sessionId)))
-        return {
-          count: planHistory.length,
-          uniqueSessionIds: sessionIds.length,
-          sessionIds,
+        const startBtn = btns.find((b) => b.textContent.includes('开始今日复习'))
+        if (startBtn) {
+          startBtn.click()
+          return true
         }
+        return false
       })
 
-      if (historyStats.count > 0) {
-        assert.equal(historyStats.uniqueSessionIds, 1, 'all plan question submissions in session share exactly 1 stable sessionId')
-        assert.ok(historyStats.sessionIds[0].startsWith('s-'), 'sessionId format is stable s-...')
-      }
-    }
+      if (started) {
+        await p.waitForSelector('.q-stem', { timeout: 10000 })
 
-    await ctx.close()
-  })
+        // Select an option
+        await p.evaluate(() => {
+          const opts = document.querySelectorAll('.opt')
+          if (opts.length > 0) {
+            opts[0].click()
+          }
+        })
+
+        // Submit the answer
+        await p.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll('button'))
+          const submitBtn = btns.find((b) => b.textContent.includes('提交') || b.textContent.includes('确认'))
+          if (submitBtn) submitBtn.click()
+        })
+
+        await new Promise((r) => setTimeout(r, 600))
+
+        // Check IndexedDB history records created for this plan session
+        const historyStats = await p.evaluate(async () => {
+          const dbmod = await import('/src/db/database.ts')
+          const allHistory = await dbmod.db.history.toArray()
+          const planHistory = allHistory.filter((h) => h.mode === 'plan')
+          const sessionIds = Array.from(new Set(planHistory.map((h) => h.sessionId)))
+          return {
+            count: planHistory.length,
+            uniqueSessionIds: sessionIds.length,
+            sessionIds,
+          }
+        })
+
+        if (historyStats.count > 0) {
+          assert.equal(
+            historyStats.uniqueSessionIds,
+            1,
+            'all plan question submissions in session share exactly 1 stable sessionId',
+          )
+          assert.ok(historyStats.sessionIds[0].startsWith('s-'), 'sessionId format is stable s-...')
+        }
+      }
+
+      await ctx.close()
+    },
+  )
 })

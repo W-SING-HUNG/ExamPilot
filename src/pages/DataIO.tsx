@@ -304,8 +304,8 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
 
           {excludedTotal > 0 && !nothingToImport && (
             <div className="result-banner warn" style={{ marginBottom: 10 }}>
-              已安全排除 {excludedTotal} 条未通过题库一致性验证的数据： 学习记录 {f?.excludedRecords}、历史 {f?.excludedHistory}
-              、 模拟考试 {f?.excludedMocks}、AI 评阅 {f?.excludedAiReviews}。
+              已安全排除 {excludedTotal} 条未通过题库一致性验证的数据： 学习记录 {f?.excludedRecords}、历史{' '}
+              {f?.excludedHistory}、 模拟考试 {f?.excludedMocks}、AI 评阅 {f?.excludedAiReviews}。
             </div>
           )}
 
@@ -373,7 +373,9 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
           {preview.bankCheck.status === 'unknown' && !nothingToImport && (
             <label className="row" style={{ gap: 8, marginBottom: 8 }}>
               <input type="checkbox" checked={legacyAck} onChange={(e) => setLegacyAck(e.target.checked)} />
-              <span className="muted">我确认这是缺少指纹的旧版备份，了解题库完整绑定无法验证的风险，仅导入偏好设置及AI评阅记录</span>
+              <span className="muted">
+                我确认这是缺少指纹的旧版备份，了解题库完整绑定无法验证的风险，仅导入偏好设置及AI评阅记录
+              </span>
             </label>
           )}
 
@@ -394,7 +396,10 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
       <CardPad style={{ marginTop: 14 }}>
         <div className="card-title">数据说明</div>
         <ul className="muted" style={{ margin: 0, paddingLeft: 20, lineHeight: 2 }}>
-          <li>备份包含学习记录、练习历史、模拟考试成绩、AI 评阅与偏好设置，并附带基于全量题干、选项与答案的 SHA-256 题库指纹。</li>
+          <li>
+            备份包含学习记录、练习历史、模拟考试成绩、AI 评阅与偏好设置，并附带基于全量题干、选项与答案的 SHA-256
+            题库指纹。
+          </li>
           <li>只有在题库指纹完全一致时，学习进度与练习历史才能安全恢复，以杜绝题目答案变动引发的串题错误。</li>
           <li>题库指纹不同或旧备份缺少指纹时，未通过完整题库一致性证明的学习记录不会混入当前统计。</li>
           <li>
