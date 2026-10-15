@@ -1461,6 +1461,7 @@ test('browser E2E', async (t) => {
       // 1. Start a local mock gateway to serve AI grade without spending real quota or network
       const http = await import('node:http')
       const mockPort = 8815
+      let aiGradeRequestReceived = false
       const mockServer = http.createServer((req, res) => {
         let body = ''
         req.on('data', (chunk) => {
@@ -1468,6 +1469,7 @@ test('browser E2E', async (t) => {
         })
         req.on('end', () => {
           if (req.url?.includes('/ai/grade')) {
+            aiGradeRequestReceived = true
             res.writeHead(200, {
               'Content-Type': 'application/json; charset=utf-8',
               'Access-Control-Allow-Origin': '*',
@@ -1512,12 +1514,11 @@ test('browser E2E', async (t) => {
         )
       }, mockPort)
 
-      // Seed one subjective question and one objective question into IndexedDB as due review
-      const seeded = await p.evaluate(async () => {
+      // Seed one subjective question into IndexedDB as due review
+      const seededSubjQid = await p.evaluate(async () => {
         const bankMod = await import('/src/lib/bank.ts')
         const dbmod = await import('/src/db/database.ts')
         const subjQ = bankMod.allQuestions.find((q) => q.type === 'short' || q.type === 'material')
-        const objQ = bankMod.allQuestions.find((q) => q.type === 'single')
         if (subjQ) {
           await dbmod.db.records.put({
             qid: subjQ.id,
@@ -1532,28 +1533,22 @@ test('browser E2E', async (t) => {
             ease: 1,
             nextReviewAt: 100,
           })
+          return subjQ.id
         }
-        if (objQ) {
-          await dbmod.db.records.put({
-            qid: objQ.id,
-            status: 'learning',
-            attempts: 1,
-            correctCount: 1,
-            wrongCount: 0,
-            lastSeenAt: 100,
-            lastCorrect: true,
-            lastAnswer: 'A',
-            intervalDays: 1,
-            ease: 1,
-            nextReviewAt: 100,
-          })
-        }
-        return { subjQid: subjQ?.id, objQid: objQ?.id }
+        return null
       })
-      assert.ok(seeded.subjQid, 'found a subjective question in bank to test')
+      assert.ok(seededSubjQid, 'found a subjective question in bank to test')
 
       await nav(p, 'plan')
       await p.waitForSelector('.page-title')
+
+      // Select minimal task count 10 so subjective question at the tail is reached quickly
+      await p.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button'))
+        const tenBtn = btns.find((b) => b.textContent?.trim() === '10 题')
+        tenBtn?.click()
+      })
+      await new Promise((r) => setTimeout(r, 400))
 
       // Must find and click the button to start plan review
       await p.waitForSelector('button.btn-primary.btn-lg', { timeout: 10000 })
@@ -1570,14 +1565,17 @@ test('browser E2E', async (t) => {
 
       await p.waitForSelector('.q-stem', { timeout: 10000 })
 
-      // Helper to answer and submit currently displayed question
-      async function answerAndSubmit(ansText) {
+      let submittedCount = 0
+      let subjectiveTested = false
+
+      // Loop through questions until we answer at least 2 questions and definitely answer a subjective question with AI review
+      for (let step = 0; step < 12; step++) {
         await p.waitForSelector('.q-stem', { timeout: 10000 })
-        const isSubj = await p.evaluate((text) => {
+        const isSubj = await p.evaluate(() => {
           const ta = document.querySelector('textarea')
           if (ta) {
             const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
-            setter?.call(ta, text)
+            setter?.call(ta, '主观题测试详细回答内容')
             ta.dispatchEvent(new Event('input', { bubbles: true }))
             return true
           }
@@ -1589,19 +1587,21 @@ test('browser E2E', async (t) => {
           const jb = document.querySelector('.judge-btn')
           if (jb) jb.click()
           return false
-        }, ansText)
+        })
 
-        // Submit
+        // Submit answer
         await p.evaluate(() => {
           const btns = Array.from(document.querySelectorAll('button'))
           const submitBtn = btns.find((b) => b.textContent?.includes('确认') || b.textContent?.includes('提交'))
           submitBtn?.click()
         })
         await new Promise((r) => setTimeout(r, 600))
+        submittedCount++
 
         if (isSubj) {
-          // Trigger AI review
-          const gradeBtn = await p.evaluate(() => {
+          subjectiveTested = true
+          // Must find the AI review button without soft skipping
+          const clickedGrade = await p.evaluate(() => {
             const btns = Array.from(document.querySelectorAll('button'))
             const b = btns.find(
               (btn) => btn.textContent?.includes('AI 参考评阅') || btn.textContent?.includes('AI 评阅'),
@@ -1612,63 +1612,97 @@ test('browser E2E', async (t) => {
             }
             return false
           })
-          if (gradeBtn) {
-            await p.waitForFunction(() => document.body.textContent?.includes('已保存'), { timeout: 8000 })
-          }
+          assert.equal(clickedGrade, true, 'AI review button must exist and be clicked')
+
+          // Must wait for AI review result to be saved
+          await p.waitForFunction(() => document.body.textContent?.includes('已保存'), { timeout: 8000 })
+          break
         }
 
-        return isSubj
+        // Navigate to next question
+        const hasNext = await p.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll('button'))
+          const nextBtn = btns.find((b) => b.textContent?.includes('下一题'))
+          if (nextBtn) {
+            nextBtn.click()
+            return true
+          }
+          return false
+        })
+        if (!hasNext) break
+        await new Promise((r) => setTimeout(r, 600))
       }
 
-      // Answer question 1
-      await answerAndSubmit('主观题第一题作答内容')
+      // 1. Strict assert: must have entered a subjective question and submitted answer
+      assert.equal(
+        subjectiveTested,
+        true,
+        'must have encountered and answered at least one subjective question in Plan',
+      )
+      // 2. Strict assert: must have answered at least 2 questions total in Plan session
+      assert.ok(submittedCount >= 2, `must have submitted at least 2 questions in session, got ${submittedCount}`)
+      // 3. Strict assert: mock gateway must have actually received the AI grade request
+      assert.equal(aiGradeRequestReceived, true, 'AI mock server must have actually received /ai/grade request')
 
-      // Click Next
-      await p.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button'))
-        const nextBtn = btns.find((b) => b.textContent?.includes('下一题'))
-        nextBtn?.click()
-      })
-      await new Promise((r) => setTimeout(r, 600))
-
-      // Answer question 2
-      await answerAndSubmit('主观题第二题作答内容')
-
-      // Assert at least 2 real answers persisted in IndexedDB under mode 'plan'
+      // 4. Assert IndexedDB data integrity and session ID consistency
       const stats = await p.evaluate(async () => {
         const dbmod = await import('/src/db/database.ts')
         const allHistory = await dbmod.db.history.toArray()
         const planHistory = allHistory.filter((h) => h.mode === 'plan')
         const sessionIds = Array.from(new Set(planHistory.map((h) => h.sessionId)))
-        const records = await dbmod.db.records.toArray()
+        const allAiReviews = await dbmod.db.aiReviews.toArray()
+        const allRecords = await dbmod.db.records.toArray()
+        const aiReview = allAiReviews[0]
         return {
-          historyCount: planHistory.length,
+          allHistory,
+          allAiReviews,
+          allRecords,
+          planHistory,
+          planHistoryCount: planHistory.length,
           uniqueSessionIds: sessionIds.length,
           sessionIds,
-          planHistory,
-          records,
+          aiReviewCount: allAiReviews.length,
+          aiReview,
         }
       })
 
-      assert.ok(stats.historyCount >= 2, `must have at least 2 answer submissions persisted, got ${stats.historyCount}`)
+      // Must have persisted AI review in IndexedDB
+      assert.ok(stats.aiReview, 'AI review must be persisted in IndexedDB aiReviews table')
+      assert.equal(stats.aiReview.result.score, 85, 'AI review result score matches mock gateway')
+
+      const answeredSubjQid = stats.aiReview.qid
+      assert.ok(answeredSubjQid, 'AI review has valid qid')
+
+      // All submissions in this plan session must share exactly 1 stable sessionId
       assert.equal(
         stats.uniqueSessionIds,
         1,
-        `all submissions in this plan session must share exactly 1 stable sessionId, got ${JSON.stringify(stats.sessionIds)}`,
+        `all plan submissions must share exactly 1 stable sessionId, got ${JSON.stringify(stats.sessionIds)}`,
       )
       assert.ok(stats.sessionIds[0].startsWith('s-'), 'sessionId format is stable s-...')
 
-      // Verify that if the seeded subjective question was submitted and AI reviewed, its attempts count was not duplicated
-      if (seeded.subjQid) {
-        const subjRecord = stats.records.find((r) => r.qid === seeded.subjQid)
-        if (subjRecord && stats.planHistory.some((h) => h.qid === seeded.subjQid)) {
-          assert.equal(
-            subjRecord.attempts,
-            2,
-            'subjective question attempt is not duplicated by AI review in same session',
-          )
-        }
-      }
+      // Subjective attempt in history and AI review in session must share the identical sessionId
+      const subjHistoryEntry = stats.planHistory.find((h) => h.qid === answeredSubjQid)
+      assert.ok(subjHistoryEntry, 'subjective attempt entry exists in history')
+      assert.equal(
+        subjHistoryEntry.sessionId,
+        stats.sessionIds[0],
+        'subjective attempt history shares identical session ID with plan session',
+      )
+      assert.equal(
+        stats.aiReview.id,
+        `ai-${stats.sessionIds[0]}-${answeredSubjQid}`,
+        'AI review row id deterministically binds to identical session ID',
+      )
+
+      // Strict assert: subjective question attempts count increased exactly once
+      const subjRecord = stats.allRecords.find((r) => r.qid === answeredSubjQid)
+      assert.ok(subjRecord, 'subjective record exists in db')
+      assert.equal(
+        subjRecord.attempts,
+        1,
+        'subjective question attempts must be exactly 1 for a new attempt, not duplicated by AI review',
+      )
 
       mockServer.close()
       await ctx.close()
