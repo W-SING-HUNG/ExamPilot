@@ -91,7 +91,7 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
     const existing = currentData()
     const ids = bankIds()
     const bankCheck = checkBank(payload, bankFingerprint(bank), bank.questions.length, ids)
-    const plan = planImport(payload, m, existing, ids)
+    const plan = planImport(payload, m, existing, ids, bankCheck.status === 'match')
     return {
       fileName,
       payload,
@@ -286,29 +286,26 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
 
           {nothingToImport && (
             <div className="result-banner bad" style={{ marginBottom: 10 }}>
-              这份备份中没有任何数据能对应到当前题库，因此<b>没有可导入的内容</b>。
-              为避免把无法验证题目—答案绑定的进度计入统计，系统不会写入任何数据。 请确认是否选错了题库版本或备份文件。
+              备份与当前题库不一致，且未包含可安全验证的数据，因此<b>没有可导入的学习进度</b>。
+              为避免题目混淆与学习数据串题污染，系统已阻止导入。请使用与当前题库匹配的备份。
             </div>
           )}
 
           {preview.bankCheck.status === 'mismatch' && !nothingToImport && (
             <div className="result-banner warn" style={{ marginBottom: 10 }}>
-              备份来自不同的题库。学习进度只在<b>题目 ID 能在当前题库中逐题匹配</b>时才会导入；
-              无法匹配的条目会被排除，不会混入覆盖率与正确率统计。
+              备份来自不同题库（指纹不一致）。由于题目选项与答案绑定无法保证一致，未经验证的学习记录与历史已自动排除，以防串题污染统计。
             </div>
           )}
-          {preview.bankCheck.status === 'unknown' && (
+          {preview.bankCheck.status === 'unknown' && !nothingToImport && (
             <div className="result-banner warn" style={{ marginBottom: 10 }}>
-              这是旧版备份（缺少题库指纹），无法整体校验题库是否一致。系统仍会逐题按 ID 匹配，
-              只导入能对应到当前题库的条目。请确认后再继续。
+              这是旧版备份（缺少完整题库指纹），缺乏题目—选项—答案绑定证明。为保证当前学习统计真实，无法直接导入学习记录与历史。
             </div>
           )}
 
           {excludedTotal > 0 && !nothingToImport && (
             <div className="result-banner warn" style={{ marginBottom: 10 }}>
-              已排除 {excludedTotal} 条无法匹配当前题库的数据： 学习记录 {f?.excludedRecords}、历史 {f?.excludedHistory}
+              已安全排除 {excludedTotal} 条未通过题库一致性验证的数据： 学习记录 {f?.excludedRecords}、历史 {f?.excludedHistory}
               、 模拟考试 {f?.excludedMocks}、AI 评阅 {f?.excludedAiReviews}。
-              这些条目的题目不在当前题库中，无法验证其题目—答案绑定，因此不会写入。
             </div>
           )}
 
@@ -373,10 +370,10 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
               <span className="muted">我确认要用备份替换现有全部学习数据（现有数据将被删除，且不可撤销）</span>
             </label>
           )}
-          {preview.bankCheck.status === 'unknown' && (
+          {preview.bankCheck.status === 'unknown' && !nothingToImport && (
             <label className="row" style={{ gap: 8, marginBottom: 8 }}>
               <input type="checkbox" checked={legacyAck} onChange={(e) => setLegacyAck(e.target.checked)} />
-              <span className="muted">我确认这是旧版备份，无法整体校验题库一致性，仍要按 ID 逐题导入</span>
+              <span className="muted">我确认这是缺少指纹的旧版备份，了解题库完整绑定无法验证的风险，仅导入偏好设置及AI评阅记录</span>
             </label>
           )}
 
@@ -397,10 +394,9 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
       <CardPad style={{ marginTop: 14 }}>
         <div className="card-title">数据说明</div>
         <ul className="muted" style={{ margin: 0, paddingLeft: 20, lineHeight: 2 }}>
-          <li>备份包含学习记录、练习历史、模拟考试成绩、AI 评阅与偏好设置，并附带题库指纹用于一致性校验。</li>
-          <li>题目 ID 由题目内容生成，因此「ID 能在当前题库中找到」即证明题目—选项—答案绑定一致。</li>
-          <li>导入时会逐题按 ID 匹配，题目不在当前题库中的记录会被排除，不会计入覆盖率与正确率。</li>
-          <li>模拟考试只有在全部题目都能匹配时才会导入，避免因部分题目缺失而改变该场成绩。</li>
+          <li>备份包含学习记录、练习历史、模拟考试成绩、AI 评阅与偏好设置，并附带基于全量题干、选项与答案的 SHA-256 题库指纹。</li>
+          <li>只有在题库指纹完全一致时，学习进度与练习历史才能安全恢复，以杜绝题目答案变动引发的串题错误。</li>
+          <li>题库指纹不同或旧备份缺少指纹时，未通过完整题库一致性证明的学习记录不会混入当前统计。</li>
           <li>
             简答题与材料分析论述题在题库中只有题干、没有标准答案，系统不伪造官方答案；AI
             评阅结果会单独保存并标注为参考评阅。

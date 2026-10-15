@@ -828,12 +828,13 @@ test('browser E2E', async (t) => {
     await ctx.close()
   })
 
-  await t.test('UI: fingerprint mismatch is explained and unverifiable rows are excluded (no deadlock)', async () => {
+  await t.test('UI: fingerprint mismatch blocks progress migration to prevent wrong-question misattribution', async () => {
     const { p, ctx } = await freshPage()
     await nav(p, 'io')
     await p.waitForSelector('.page-title')
-    // A backup from a DIFFERENT bank that still references one REAL current
-    // question plus one question that does not exist here.
+    // A backup from a DIFFERENT bank that references one current question id
+    // Because bank fingerprint does not match, learning progress cannot guarantee
+    // option/answer binding consistency, so it is safely excluded.
     await p.evaluate(async () => {
       const m = await import('/src/lib/io.ts')
       const bankMod = await import('/src/lib/bank.ts')
@@ -855,19 +856,6 @@ test('browser E2E', async (t) => {
             ease: 2,
             nextReviewAt: 1,
           },
-          {
-            qid: 'ghost-does-not-exist',
-            status: 'learning',
-            attempts: 5,
-            correctCount: 5,
-            wrongCount: 0,
-            lastSeenAt: 1,
-            lastCorrect: true,
-            lastAnswer: 'A',
-            intervalDays: 1,
-            ease: 2,
-            nextReviewAt: 1,
-          },
         ],
         history: [],
         mocks: [],
@@ -883,30 +871,28 @@ test('browser E2E', async (t) => {
 
     const body = await p.evaluate(() => document.body.textContent)
     assert.match(body, /题库不一致/, 'mismatch is surfaced')
-    assert.match(body, /逐题匹配|只在/, 'the matching rule is explained')
-    assert.match(body, /已排除 1 条/, 'the excluded row count is stated')
+    assert.match(body, /没有可导入的学习进度|防串题污染/, 'explains why progress cannot be migrated')
 
-    // NOT a deadlock: there is verifiable data, so confirm must be actionable.
+    // Confirm is blocked because there is no verified data to import
     const disabled = await p.evaluate(() => {
       const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
       return b ? b.disabled : null
     })
-    assert.equal(disabled, false, 'confirm must be actionable when some rows are verifiable')
+    assert.equal(disabled, true, 'confirm is blocked when fingerprint mismatches without verified bindings')
 
-    // Confirm, then verify ONLY the verifiable row reached the database.
+    // Cancel must leave the DB untouched
     await p.evaluate(() => {
       Array.from(document.querySelectorAll('.btn'))
-        .find((x) => x.textContent.trim() === '确认导入')
+        .find((x) => x.textContent.trim() === '取消')
         ?.click()
     })
-    await p.waitForFunction(() => document.body.textContent.includes('导入完成'), { timeout: 15000 })
+    await new Promise((r) => setTimeout(r, 400))
     const stored = await p.evaluate(async () => {
       const dbmod = await import('/src/db/database.ts')
       const snap = await dbmod.snapshotDb(dbmod.db)
-      return { qids: snap.records.map((r) => r.qid), count: snap.records.length }
+      return { count: snap.records.length }
     })
-    assert.equal(stored.count, 1, 'only the verifiable record is imported')
-    assert.ok(!stored.qids.includes('ghost-does-not-exist'), 'unverifiable progress never enters the DB')
+    assert.equal(stored.count, 0, 'database remains clean')
     await ctx.close()
   })
 
@@ -971,7 +957,7 @@ test('browser E2E', async (t) => {
     await ctx.close()
   })
 
-  await t.test('UI: a legacy backup without a fingerprint warns and needs acknowledgement', async () => {
+  await t.test('UI: a legacy backup without a fingerprint warns and blocks unverified progress', async () => {
     const { p, ctx } = await freshPage()
     await nav(p, 'io')
     await p.waitForSelector('.page-title')
@@ -994,9 +980,8 @@ test('browser E2E', async (t) => {
 
     const body = await p.evaluate(() => document.body.textContent)
     assert.match(body, /旧版备份/, 'legacy backup is identified')
-    assert.match(body, /无法整体校验题库是否一致/, 'the risk is stated')
-    assert.match(body, /逐题按 ID 匹配/, 'the fallback matching rule is explained')
-    assert.match(body, /我确认这是旧版备份/, 'an explicit acknowledgement is required')
+    assert.match(body, /无法确认题目是否一致|缺乏题目/, 'the risk is stated')
+    assert.match(body, /我确认这是缺少指纹的旧版备份/, 'an explicit acknowledgement is required')
 
     const disabled = await p.evaluate(() => {
       const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')

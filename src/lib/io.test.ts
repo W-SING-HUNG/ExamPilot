@@ -429,7 +429,7 @@ describe('io / diffImport', () => {
   it('diff reflects the FILTERED rows, not the raw backup size', () => {
     const existing = { ...emptyExisting, settings: SETTINGS }
     const p = payload({ records: [mkre('q1', 1), mkre('ghost', 1)] })
-    const plan = planImport(p, 'merge', existing, new Set(['q1']))
+    const plan = planImport(p, 'merge', existing, new Set(['q1']), true)
     const d = diffImport(plan, 'merge', existing)
     expect(d.records.incoming).toBe(1) // ghost excluded
     expect(plan.filter.excludedRecords).toBe(1)
@@ -441,13 +441,13 @@ describe('io / diffImport', () => {
 // ---------------------------------------------------------------------------
 
 describe('io / filterPayloadToBank', () => {
-  it('keeps verifiable rows and excludes rows whose question is absent', () => {
+  it('keeps verifiable rows and excludes rows whose question is absent when fingerprint matches', () => {
     const p = payload({
       records: [mkre('q1', 1), mkre('ghost', 1)],
       history: [mkhist('h1', 'q1'), mkhist('h2', 'ghost')],
       aiReviews: [mkai('a1', 'q1'), mkai('a2', 'ghost')],
     })
-    const { payload: kept, report } = filterPayloadToBank(p, new Set(['q1']))
+    const { payload: kept, report } = filterPayloadToBank(p, new Set(['q1']), true)
     expect(kept.records.map((r) => r.qid)).toEqual(['q1'])
     expect(kept.history.map((h) => h.qid)).toEqual(['q1'])
     expect(kept.aiReviews.map((a) => a.qid)).toEqual(['q1'])
@@ -460,7 +460,7 @@ describe('io / filterPayloadToBank', () => {
   it('drops a mock unless EVERY referenced question exists', () => {
     const full = { ...mkmock('m1'), submissions: { q1: 'A' } }
     const partial = { ...mkmock('m2'), submissions: { q1: 'A', ghost: 'B' } }
-    const { payload: kept, report } = filterPayloadToBank(payload({ mocks: [full, partial] }), new Set(['q1']))
+    const { payload: kept, report } = filterPayloadToBank(payload({ mocks: [full, partial] }), new Set(['q1']), true)
     expect(kept.mocks.map((m) => m.id)).toEqual(['m1'])
     expect(report.excludedMocks).toBe(1)
   })
@@ -472,7 +472,7 @@ describe('io / filterPayloadToBank', () => {
       mocks: [],
       aiReviews: [],
     })
-    const { payload: kept, report } = filterPayloadToBank(p, new Set(['q1']))
+    const { payload: kept, report } = filterPayloadToBank(p, new Set(['q1']), true)
     expect(kept.records).toHaveLength(0)
     expect(kept.history).toHaveLength(0)
     expect(report.nothingVerifiable).toBe(true)
@@ -486,7 +486,7 @@ describe('io / filterPayloadToBank', () => {
       aiReviews: [],
       bankFingerprint: 'other-bank',
     })
-    const plan = planImport(p, 'replace', emptyExisting, new Set(['q1']))
+    const plan = planImport(p, 'replace', emptyExisting, new Set(['q1']), false)
     // nothing unverifiable reaches the write plan
     expect(plan.records).toHaveLength(0)
     expect(plan.filter.excludedRecords).toBe(1)
@@ -495,8 +495,52 @@ describe('io / filterPayloadToBank', () => {
 
   it('a matching bank keeps everything (no false positives)', () => {
     const p = payload({ records: [mkre('q1', 1), mkre('q2', 1)] })
-    const plan = planImport(p, 'merge', emptyExisting, new Set(['q1', 'q2']))
+    const plan = planImport(p, 'merge', emptyExisting, new Set(['q1', 'q2']), true)
     expect(plan.records).toHaveLength(2)
     expect(plan.filter.excludedRecords).toBe(0)
+  })
+
+  it('REGRESSION: same question ID but different answer in mismatched bank is NOT migrated', () => {
+    // Question q1 has answer 'A' in the current bank, but backup comes from a bank where q1 had answer 'B'
+    // Because bank fingerprint does not match, progress is blocked to prevent wrong-question misattribution
+    const p = payload({
+      records: [mkre('q1', 5)],
+      history: [mkhist('h1', 'q1')],
+      bankFingerprint: 'different-fingerprint-due-to-different-answer',
+    })
+    const plan = planImport(p, 'merge', emptyExisting, new Set(['q1']), false)
+    expect(plan.records).toHaveLength(0)
+    expect(plan.history).toHaveLength(0)
+    expect(plan.filter.excludedRecords).toBe(1)
+    expect(plan.filter.excludedHistory).toBe(1)
+  })
+
+  it('REGRESSION: same question ID but different option order in mismatched bank is NOT migrated', () => {
+    const p = payload({
+      records: [mkre('q1', 3)],
+      history: [mkhist('h1', 'q1')],
+      mocks: [],
+      aiReviews: [],
+      bankFingerprint: 'different-fingerprint-due-to-option-reorder',
+    })
+    const plan = planImport(p, 'replace', emptyExisting, new Set(['q1']), false)
+    expect(plan.records).toHaveLength(0)
+    expect(plan.history).toHaveLength(0)
+    expect(plan.filter.nothingVerifiable).toBe(true)
+  })
+
+  it('REGRESSION: legacy backup without fingerprint cannot import learning progress', () => {
+    const p = payload({
+      records: [mkre('q1', 2)],
+      history: [mkhist('h1', 'q1')],
+    }) as Record<string, unknown>
+    delete p.bankFingerprint
+    const check = checkBank(p as never, 'current-sha256-fingerprint', 10, new Set(['q1']))
+    expect(check.status).toBe('unknown')
+
+    const plan = planImport(p as never, 'merge', emptyExisting, new Set(['q1']), false)
+    expect(plan.records).toHaveLength(0)
+    expect(plan.history).toHaveLength(0)
+    expect(plan.filter.excludedRecords).toBe(1)
   })
 })

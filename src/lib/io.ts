@@ -564,16 +564,20 @@ export interface BankCheck {
 }
 
 /**
- * Report produced by filtering a backup down to rows whose question id exists in
- * the current bank.
+ * Report produced by verifying a backup against the current bank.
  *
- * Question ids are content-derived (the parser embeds a hash of the stem), so an
- * id that exists in the current bank is itself per-question identity evidence:
- * the same id means the same question–option–answer binding. Rows whose id is
- * absent cannot be verified and are therefore excluded rather than imported.
+ * Rules:
+ *  - When the bank fingerprint matches, the whole question–option–answer binding
+ *    is guaranteed identical, so all rows can be safely restored.
+ *  - When the fingerprint differs or is missing (legacy backup), cross-bank migration
+ *    requires trustworthy full-content verification per question. Without full-content
+ *    proof, learning records and history cannot be verified against the current bank
+ *    and are EXCLUDED to prevent progress corruption / wrong-question misattribution.
+ *  - Mocks referencing missing/unmatched questions are likewise excluded.
  */
 export interface BankFilterReport {
   applied: boolean
+  fingerprintMatch: boolean
   excludedRecords: number
   excludedHistory: number
   excludedMocks: number
@@ -582,33 +586,39 @@ export interface BankFilterReport {
   keptHistory: number
   keptMocks: number
   keptAiReviews: number
-  /**
-   * True when the backup DID contain data but none of it could be verified
-   * against the current bank. An entirely empty backup is not "unverifiable" —
-   * restoring nothing is a legitimate operation.
-   */
+  /** true when the backup had data but nothing could be verified against the current bank */
   nothingVerifiable: boolean
 }
 
 /**
- * Keep only rows that reference a question present in the current bank.
+ * Filter payload rows against the current bank.
  *
- * A mock is kept only when EVERY question it references exists, because dropping
- * individual submissions would silently change that exam's score.
+ * If `fingerprintMatch` is true, all rows matching valid bank question IDs are accepted.
+ * If `fingerprintMatch` is false (mismatch or legacy backup without fingerprint),
+ * cross-bank progress migration is blocked: question records and history cannot guarantee
+ * option-order and answer binding consistency, so they are excluded. Mocks and AI reviews
+ * referencing unknown questions are also excluded.
  */
 export function filterPayloadToBank(
   payload: ExportPayload,
   bankQuestionIds: Set<string>,
+  fingerprintMatch: boolean = false,
 ): { payload: ExportPayload; report: BankFilterReport } {
-  const records = payload.records.filter((r) => bankQuestionIds.has(r.qid))
-  const history = payload.history.filter((h) => bankQuestionIds.has(h.qid))
+  // If fingerprint matches completely, we verify membership in the current bank question IDs.
+  // If fingerprint differs or is unknown, question records and history have no content proof,
+  // so they cannot be migrated to the active database.
+  const records = fingerprintMatch ? payload.records.filter((r) => bankQuestionIds.has(r.qid)) : []
+  const history = fingerprintMatch ? payload.history.filter((h) => bankQuestionIds.has(h.qid)) : []
   const aiReviews = payload.aiReviews.filter((a) => bankQuestionIds.has(a.qid))
-  const mocks = payload.mocks.filter((m) => Object.keys(m.submissions ?? {}).every((qid) => bankQuestionIds.has(qid)))
+  const mocks = payload.mocks.filter((m) =>
+    fingerprintMatch && Object.keys(m.submissions ?? {}).every((qid) => bankQuestionIds.has(qid)),
+  )
 
   const totalIn = payload.records.length + payload.history.length + payload.mocks.length + payload.aiReviews.length
 
   const report: BankFilterReport = {
     applied: true,
+    fingerprintMatch,
     excludedRecords: payload.records.length - records.length,
     excludedHistory: payload.history.length - history.length,
     excludedMocks: payload.mocks.length - mocks.length,
@@ -617,7 +627,6 @@ export function filterPayloadToBank(
     keptHistory: history.length,
     keptMocks: mocks.length,
     keptAiReviews: aiReviews.length,
-    // Only a NON-EMPTY backup whose every row was excluded counts as unverifiable.
     nothingVerifiable:
       totalIn > 0 && records.length === 0 && history.length === 0 && mocks.length === 0 && aiReviews.length === 0,
   }
@@ -682,10 +691,11 @@ export function planImport(
   mode: RestoreMode,
   existing?: ExistingData,
   bankQuestionIds?: Set<string>,
+  fingerprintMatch: boolean = false,
 ): ImportPlan {
   const { payload: verified, report } = bankQuestionIds
-    ? filterPayloadToBank(payload, bankQuestionIds)
-    : { payload, report: emptyFilterReport() }
+    ? filterPayloadToBank(payload, bankQuestionIds, fingerprintMatch)
+    : { payload, report: emptyFilterReport(fingerprintMatch) }
 
   const incomingRecords = verified.records ?? []
   const incomingHistory = verified.history ?? []
@@ -733,9 +743,10 @@ export function planImport(
   }
 }
 
-function emptyFilterReport(): BankFilterReport {
+function emptyFilterReport(fingerprintMatch: boolean = false): BankFilterReport {
   return {
     applied: false,
+    fingerprintMatch,
     excludedRecords: 0,
     excludedHistory: 0,
     excludedMocks: 0,
