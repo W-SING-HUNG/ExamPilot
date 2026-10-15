@@ -503,11 +503,19 @@ test('browser E2E', async (t) => {
     const { p, ctx } = await freshPage()
     await nav(p, 'settings')
     await p.waitForSelector('.page-title')
+    // 主题按钮只更新草稿，必须点击「保存设置」后才会应用到 DOM
     await p.evaluate(() => {
       const btns = Array.from(document.querySelectorAll('.btn.btn-sm'))
       btns.find((b) => b.textContent.includes('深色'))?.click()
     })
-    await new Promise((r) => setTimeout(r, 400))
+    await new Promise((r) => setTimeout(r, 200))
+    await p.evaluate(() => {
+      const save = Array.from(document.querySelectorAll('.btn.btn-primary')).find((b) =>
+        b.textContent.includes('保存设置'),
+      )
+      save?.click()
+    })
+    await new Promise((r) => setTimeout(r, 500))
     const theme = await p.evaluate(() => document.documentElement.dataset.theme)
     if (theme !== 'dark') {
       const btns = await p.evaluate(() =>
@@ -520,6 +528,11 @@ test('browser E2E', async (t) => {
     assert.equal(theme, 'dark')
     const bg = await p.evaluate(() => getComputedStyle(document.body).backgroundColor)
     assert.notEqual(bg, 'rgb(246, 247, 249)')
+    // 主题偏好必须持久化：刷新后仍是深色
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell', { timeout: 20000 })
+    const themeAfterReload = await p.evaluate(() => document.documentElement.dataset.theme)
+    assert.equal(themeAfterReload, 'dark', 'theme preference persists across reload')
     await ctx.close()
   })
 })

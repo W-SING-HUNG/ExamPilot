@@ -1,0 +1,14 @@
+test: 修正深色主题测试并新增持久化校验
+
+问题：CI 中 dark theme 子测试失败（expected dark, actual light）。
+原因：主题按钮只更新草稿状态，必须点击「保存设置」才应用到 DOM。
+此前本地通过是因为本机开启了系统深色模式（auto 解析为 dark），
+测试实际上依赖了操作系统偏好，在 Linux runner 上必然失败。
+
+修复
+- 测试补点「保存设置」后再断言 dataset.theme === 'dark'
+- 新增刷新后主题仍为深色的持久化断言
+
+验证（本地，AI 代理未配置状态，与 CI 一致）
+- browser E2E 14/14 通过
+- prettier --check 通过
