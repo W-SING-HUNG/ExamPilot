@@ -99,6 +99,16 @@ jobs:
           done
           echo "dev server failed to start"; cat vite.log; exit 1
 
+      # AI 代理未配置（无密钥），仅验证「未配置时网站仍可用」这一降级路径
+      - name: 启动 AI 代理（未配置状态）
+        run: |
+          npm run server > ai-proxy.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8787/api/ai/status > /dev/null; then echo "ai proxy ready"; exit 0; fi
+            sleep 1
+          done
+          echo "ai proxy failed to start"; cat ai-proxy.log; exit 1
+
       - name: 浏览器 E2E（公开示例题库）
         run: npm run test:browser
         env:
@@ -110,5 +120,7 @@ jobs:
         run: |
           echo "----- vite.log -----"
           cat vite.log 2>/dev/null || true
+          echo "----- ai-proxy.log -----"
+          cat ai-proxy.log 2>/dev/null || true
           echo "----- dev server probe -----"
           curl -sS -o /dev/null -w "%{http_code}\n" http://localhost:5173/ || true
