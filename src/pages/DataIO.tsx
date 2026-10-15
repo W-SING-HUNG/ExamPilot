@@ -1,16 +1,25 @@
 import { useRef, useState } from 'react'
 import { useStore } from '../store/StoreContext'
-import { parseExport, makeExportPayload, serialize, applyImport } from '../lib/io'
+import {
+  parseExport,
+  makeExportPayload,
+  serialize,
+  planImport,
+  describePlan,
+  bankFingerprint,
+  type RestoreMode,
+} from '../lib/io'
 import { CardPad, PageHead, useToast } from '../components/ui'
 import { APP_VERSION } from '../lib/meta'
 import { bank } from '../lib/bank'
 
 export function DataIO({ params: _params }: { params: Record<string, string> }) {
-  const { records, history, mocks, aiReviews, settings, ready, importRecords } = useStore()
+  const { records, history, mocks, aiReviews, settings, ready, restoreBackup } = useStore()
   const { toast, el } = useToast()
   const fileRef = useRef<HTMLInputElement>(null)
   const [msg, setMsg] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
+  const [mode, setMode] = useState<RestoreMode>('replace')
 
   const exportAll = () => {
     const payload = makeExportPayload({
@@ -19,6 +28,8 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
       history,
       mocks,
       aiReviews,
+      bankFingerprint: bankFingerprint(bank),
+      bankCount: bank.questions.length,
     })
     const blob = new Blob([serialize(payload)], { type: 'application/json' })
     const a = document.createElement('a')
@@ -41,36 +52,65 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
 
   const onFile = async (f: File) => {
     setBusy(true)
+    setMsg([])
     try {
       const text = await f.text()
       const res = parseExport(text)
-      if (!res.ok) {
-        setMsg([`导入失败：${res.errors.slice(0, 6).join('；')}`])
+      if (!res.ok || !res.payload) {
+        setMsg([`导入失败：${res.errors.slice(0, 6).join('；')}`, '未写入任何数据。'])
         return
       }
-      if (!res.payload) {
-        setMsg(['导入失败：解析结果为空'])
-        return
-      }
-      const bankIds = new Set(bank.questions.map((q) => q.id))
-      const unknown = res.payload.records.filter((r) => !bankIds.has(r.qid)).length
-      const out = await applyImport(res.payload, {
-        putRecords: async (r) => {
-          await importRecords(r, [], [], [])
-        },
-        putHistory: async () => {},
-        putMocks: async () => {},
-        putAi: async () => {},
-        clearAll: async () => {},
+
+      const localFp = bankFingerprint(bank)
+      const bankMismatch = Boolean(res.payload.bankFingerprint) && res.payload.bankFingerprint !== localFp
+      const unknownQids = res.payload.records.filter((r) => !bank.questions.some((q) => q.id === r.qid)).length
+
+      // Preview the plan BEFORE writing anything.
+      const plan = planImport(res.payload, mode, {
+        records: Array.from(records.values()),
+        history,
+        mocks,
+        aiReviews,
       })
-      setMsg([
-        `已导入 ${res.payload.records.length} 条学习记录`,
-        unknown ? `警告：${unknown} 条记录的 qid 不在当前题库中（题库版本可能不同）` : '所有记录均与当前题库匹配',
-        ...out.detail,
-      ])
+
+      const lines: string[] = []
+      if (bankMismatch) {
+        lines.push(
+          `警告：备份来自不同的题库（备份 ${res.payload.bankCount ?? '?'} 题，当前 ${bank.questions.length} 题）。` +
+            `题库不一致时历史与模拟记录可能无法对应到题目。`,
+        )
+      }
+      if (unknownQids > 0) {
+        lines.push(`警告：${unknownQids} 条学习记录的 qid 不在当前题库中。`)
+      }
+      lines.push(...res.warnings, ...describePlan(plan, mode))
+
+      if (
+        plan.records.length === 0 &&
+        plan.history.length === 0 &&
+        plan.mocks.length === 0 &&
+        plan.aiReviews.length === 0
+      ) {
+        lines.push('导入中止：备份中没有任何有效数据，未写入数据库。')
+        setMsg(lines)
+        return
+      }
+
+      // Single transaction — either everything is restored or nothing is.
+      await restoreBackup({
+        records: plan.records,
+        history: plan.history,
+        mocks: plan.mocks,
+        aiReviews: plan.aiReviews,
+        settings: (res.payload.settings as typeof settings | null) ?? null,
+      })
+
+      lines.push('导入完成：学习记录、历史、模拟考试、AI 评阅与偏好设置已全部恢复。')
+      setMsg(lines)
       toast('导入完成')
     } catch (e) {
-      setMsg([`导入异常：${(e as Error).message}`])
+      // Transaction aborted: previous data is untouched.
+      setMsg([`导入失败：${(e as Error).message}`, '数据库未发生任何更改（事务已回滚）。'])
     } finally {
       setBusy(false)
     }
@@ -114,7 +154,25 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
         <CardPad>
           <div className="card-title">导入恢复</div>
           <div className="muted" style={{ marginBottom: 10 }}>
-            选择此前导出的 JSON 文件。导入会与现有记录合并（同一 qid 以导入数据为准）；格式不符时不会写入任何数据。
+            选择此前导出的 JSON 文件。导入前会先校验格式、题库一致性与数据有效性，并在同一事务中写入；
+            任一步骤失败则整体回滚，不会留下半成品数据。
+          </div>
+          <div className="field">
+            <span className="field-label">恢复策略</span>
+            <div className="btn-row">
+              <button
+                className={`btn btn-sm ${mode === 'replace' ? 'btn-primary' : ''}`}
+                onClick={() => setMode('replace')}
+              >
+                替换（清空后写入）
+              </button>
+              <button
+                className={`btn btn-sm ${mode === 'merge' ? 'btn-primary' : ''}`}
+                onClick={() => setMode('merge')}
+              >
+                合并（同 ID 以备份为准）
+              </button>
+            </div>
           </div>
           <input
             ref={fileRef}
@@ -144,6 +202,7 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
       <CardPad style={{ marginTop: 14 }}>
         <div className="card-title">数据说明</div>
         <ul className="muted" style={{ margin: 0, paddingLeft: 20, lineHeight: 2 }}>
+          <li>备份包含学习记录、练习历史、模拟考试成绩、AI 评阅与偏好设置，导出时附带题库指纹用于一致性校验。</li>
           <li>题目数据来自指定题库来源，题干、选项、答案与章节均按原文解析，未做事实修改。</li>
           <li>
             简答题与材料分析论述题在题库中只有题干、没有标准答案，系统不伪造官方答案；AI

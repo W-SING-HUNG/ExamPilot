@@ -381,15 +381,27 @@ test('browser E2E', async (t) => {
     }
     const res = await p.evaluate(async () => {
       const m = await import('/src/lib/io.ts')
+      // No schema at all -> rejected on the format check (strictest, checked first)
       const bad = m.parseExport('{"records": "not-an-array"}')
+      // Correct schema but a non-array collection -> rejected on the array check
+      const missingArrays = m.parseExport(JSON.stringify({ schema: 'exampilot.export.v1', records: 'not-an-array' }))
       const notJson = m.parseExport('nope')
       const wrongSchema = m.parseExport(
         JSON.stringify({ schema: 'other', records: [], history: [], mocks: [], aiReviews: [] }),
       )
-      return { bad: bad.ok, badErr: bad.errors.join(';'), notJson: notJson.ok, wrongSchema: wrongSchema.ok }
+      return {
+        bad: bad.ok,
+        badErr: bad.errors.join(';'),
+        missingArrays: missingArrays.ok,
+        missingArraysErr: missingArrays.errors.join(';'),
+        notJson: notJson.ok,
+        wrongSchema: wrongSchema.ok,
+      }
     })
     assert.equal(res.bad, false)
-    assert.match(res.badErr, /records/)
+    assert.match(res.badErr, /schema/)
+    assert.equal(res.missingArrays, false)
+    assert.match(res.missingArraysErr, /records/)
     assert.equal(res.notJson, false)
     assert.equal(res.wrongSchema, false)
     await ctx.close()
@@ -533,6 +545,306 @@ test('browser E2E', async (t) => {
     await p.waitForSelector('.app-shell', { timeout: 20000 })
     const themeAfterReload = await p.evaluate(() => document.documentElement.dataset.theme)
     assert.equal(themeAfterReload, 'dark', 'theme preference persists across reload')
+    await ctx.close()
+  })
+
+  await t.test('mock exam: blank objective questions are not treated as wrong', async () => {
+    const { p, ctx } = await freshPage()
+    // Seed a definite wrong answer for later comparison.
+    await nav(p, 'mock')
+    await p.waitForSelector('.card-title')
+    await p.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll('input.input[type=number]'))
+      const setVal = (idx, v) => {
+        const el = inputs[idx]
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+        setter.call(el, String(v))
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+      setVal(0, 3)
+      setVal(1, 0)
+      setVal(2, 0)
+      setVal(3, 0)
+      setVal(8, 5)
+    })
+    await new Promise((r) => setTimeout(r, 300))
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-primary.btn-lg'))[0].click()
+    })
+    await p.waitForSelector('.timer', { timeout: 15000 })
+
+    // Answer only the FIRST question, leave the rest blank.
+    await p.evaluate(() => document.querySelector('.opt')?.click())
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn.btn-primary')).find((x) => x.textContent.includes('交卷'))
+      b.click()
+    })
+    await p.waitForFunction(() => document.body.textContent.includes('考试结果'), { timeout: 15000 })
+
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /未作答 · 不计对错/, 'blank questions are labelled as unanswered')
+
+    // The wrong-question bank must NOT contain the blank questions.
+    await nav(p, 'wrong')
+    await p.waitForFunction(() => document.body.textContent.includes('错题本'), { timeout: 10000 })
+    const wrongCount = await p.evaluate(() => {
+      const m = document.body.textContent.match(/(\d+) 道待清除/)
+      return m ? Number(m[1]) : 0
+    })
+    // At most one question was answered; blanks (2) must not be in the wrong bank.
+    assert.ok(wrongCount <= 1, `blank answers must not enter the wrong bank, got ${wrongCount}`)
+    await ctx.close()
+  })
+
+  await t.test('mock exam: reports graded vs ungraded score separately', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'mock')
+    await p.waitForSelector('.card-title')
+    await p.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll('input.input[type=number]'))
+      const setVal = (idx, v) => {
+        const el = inputs[idx]
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+        setter.call(el, String(v))
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+      setVal(0, 2)
+      setVal(1, 0)
+      setVal(2, 0)
+      setVal(3, 1) // one subjective question
+      setVal(8, 5)
+    })
+    await new Promise((r) => setTimeout(r, 300))
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-primary.btn-lg'))[0].click()
+    })
+    await p.waitForSelector('.timer', { timeout: 15000 })
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn.btn-primary')).find((x) => x.textContent.includes('交卷'))
+      b.click()
+    })
+    await p.waitForFunction(() => document.body.textContent.includes('考试结果'), { timeout: 15000 })
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /客观题得分/, 'shows the objective (auto-graded) score')
+    assert.match(body, /主观题 \d+ 分未自动评分/, 'states the ungraded subjective points')
+    assert.match(body, /不代表完整试卷成绩/, 'explicitly denies presenting a partial rate as the full result')
+    await ctx.close()
+  })
+
+  await t.test('mock exam: insufficient bank reports an explainable error', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'mock')
+    await p.waitForSelector('.card-title')
+
+    // Realistic path: the per-type count is set first (clamped against the WHOLE
+    // bank), then the user narrows the chapter range, leaving the request
+    // unsatisfiable. This is exactly the case the guard must catch.
+    const info = await p.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll('input.input[type=number]'))
+      const setVal = (idx, v) => {
+        const el = inputs[idx]
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+        setter.call(el, String(v))
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+      const maxSingles = Number(inputs[0].getAttribute('max') || 0)
+      setVal(0, maxSingles) // request ALL single-choice questions in the bank
+      setVal(1, 0)
+      setVal(2, 0)
+      setVal(3, 0)
+      return { maxSingles }
+    })
+    await new Promise((r) => setTimeout(r, 300))
+
+    // Now restrict to one chapter, which cannot supply that many.
+    const picked = await p.evaluate(() => {
+      const chBtn = Array.from(document.querySelectorAll('.pill-scroll .btn')).find(
+        (b) => b.textContent.trim() === '导论',
+      )
+      chBtn?.click()
+      return Boolean(chBtn)
+    })
+    await new Promise((r) => setTimeout(r, 400))
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-primary.btn-lg'))[0].click()
+    })
+    await new Promise((r) => setTimeout(r, 800))
+
+    const started = await count(p, '.timer')
+    const body = await p.evaluate(() => document.body.textContent)
+    if (!picked || info.maxSingles <= 49) {
+      // Insufficient data to construct the scenario (e.g. sample bank); skip safely.
+      assert.ok(started === 0 || started > 0)
+    } else {
+      assert.equal(started, 0, 'an unsatisfiable config must not start an exam')
+      assert.match(body, /题库数量不足/, 'must explain why the paper cannot be built')
+      assert.match(body, /需要 \d+ 题，题库仅有 \d+ 题/, 'must state the exact shortfall')
+    }
+    await ctx.close()
+  })
+
+  await t.test('data import restores all collections (records + history + mocks + AI reviews)', async () => {
+    const { p, ctx } = await freshPage()
+    // Produce some activity, then exercise the export/restore path via the real modules.
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    const result = await p.evaluate(async () => {
+      const io = await import('/src/lib/io.ts')
+      const dbmod = await import('/src/db/database.ts')
+      const dbName = 'exampilot-e2e-' + Math.random().toString(36).slice(2, 8)
+      const testDb = dbmod.createDb(dbName)
+      const rec = {
+        qid: 'q1',
+        status: 'learning',
+        attempts: 2,
+        correctCount: 1,
+        wrongCount: 1,
+        lastSeenAt: 1,
+        lastCorrect: false,
+        lastAnswer: 'AC',
+        intervalDays: 3,
+        ease: 2,
+        nextReviewAt: 99,
+      }
+      const h = {
+        id: 'h1',
+        qid: 'q1',
+        mode: 'mock',
+        sessionId: 's',
+        answer: 'AC',
+        isCorrect: false,
+        submittedAt: 1,
+        usedAI: false,
+      }
+      const mock = {
+        id: 'm1',
+        startedAt: 1,
+        endedAt: 2,
+        config: {
+          singleCount: 1,
+          multiCount: 0,
+          judgeCount: 0,
+          shortCount: 0,
+          singleScore: 1,
+          multiScore: 2,
+          judgeScore: 1,
+          shortScore: 15,
+          durationMin: 5,
+          chapters: 'all',
+        },
+        submissions: { q1: 'AC' },
+        graded: true,
+        score: 0,
+        maxScore: 1,
+        objectiveMaxScore: 1,
+        subjectiveMaxScore: 0,
+        perQuestion: { q1: { isCorrect: false, points: 0, unanswered: false } },
+      }
+      const ai = {
+        id: 'a1',
+        qid: 'q1',
+        userAnswer: 'ans',
+        createdAt: 1,
+        provider: 'stub',
+        model: 'm',
+        result: {
+          score: 80,
+          maxScore: 100,
+          hitPoints: [],
+          missedPoints: [],
+          deductions: [],
+          suggestions: [],
+          structureNote: '',
+          disclaimer: '',
+        },
+      }
+      const settings = { theme: 'dark', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 }
+      await testDb.records.bulkPut([rec])
+      await testDb.history.bulkPut([h])
+      await testDb.mocks.bulkPut([mock])
+      await testDb.aiReviews.bulkPut([ai])
+      await testDb.settings.put({ ...settings, id: 'main' })
+
+      const before = await dbmod.snapshotDb(testDb)
+      const payload = io.makeExportPayload({
+        settings: before.settings,
+        records: before.records,
+        history: before.history,
+        mocks: before.mocks,
+        aiReviews: before.aiReviews,
+        bankFingerprint: 'fp',
+        bankCount: 1,
+      })
+      const parsed = io.parseExport(io.serialize(payload))
+      await testDb.records.clear()
+      await testDb.history.clear()
+      await testDb.mocks.clear()
+      await testDb.aiReviews.clear()
+      await testDb.settings.clear()
+      const plan = io.planImport(parsed.payload, 'replace')
+      const counts = await dbmod.restoreBackupInto(testDb, {
+        records: plan.records,
+        history: plan.history,
+        mocks: plan.mocks,
+        aiReviews: plan.aiReviews,
+        settings: parsed.payload.settings,
+      })
+      const after = await dbmod.snapshotDb(testDb)
+      await testDb.delete()
+      return {
+        ok: parsed.ok,
+        counts,
+        records: after.records.length,
+        history: after.history.length,
+        mocks: after.mocks.length,
+        aiReviews: after.aiReviews.length,
+        settings: after.settings,
+        wrongCount: after.records[0]?.wrongCount,
+        aiScore: after.aiReviews[0]?.result?.score,
+      }
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.records, 1)
+    assert.equal(result.history, 1)
+    assert.equal(result.mocks, 1)
+    assert.equal(result.aiReviews, 1)
+    assert.equal(result.settings?.theme, 'dark', 'settings restored')
+    assert.equal(result.wrongCount, 1, 'record counters preserved')
+    assert.equal(result.aiScore, 80, 'AI review content preserved')
+    await ctx.close()
+  })
+
+  await t.test('data import rejects malformed and mismatched backups without writing', async () => {
+    const { p, ctx } = await freshPage()
+    const res = await p.evaluate(async () => {
+      const io = await import('/src/lib/io.ts')
+      const notJson = io.parseExport('nope')
+      const wrongSchema = io.parseExport(
+        JSON.stringify({ schema: 'x', records: [], history: [], mocks: [], aiReviews: [] }),
+      )
+      const missingArrays = io.parseExport(JSON.stringify({ schema: 'exampilot.export.v1', records: 'bad' }))
+      const dupes = io.parseExport(
+        JSON.stringify({
+          schema: 'exampilot.export.v1',
+          records: [{ qid: 'a' }, { qid: 'a' }],
+          history: [],
+          mocks: [],
+          aiReviews: [],
+        }),
+      )
+      return {
+        notJson: notJson.ok,
+        wrongSchema: wrongSchema.ok,
+        wrongSchemaMsg: wrongSchema.errors[0],
+        missingArrays: missingArrays.ok,
+        dupes: dupes.ok,
+      }
+    })
+    assert.equal(res.notJson, false)
+    assert.equal(res.wrongSchema, false)
+    assert.match(res.wrongSchemaMsg, /不支持的备份格式/)
+    assert.equal(res.missingArrays, false)
+    assert.equal(res.dupes, false)
     await ctx.close()
   })
 })

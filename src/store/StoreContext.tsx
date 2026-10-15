@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { db } from '../db/database'
+import { db, restoreBackupInto } from '../db/database'
 import type { QRecord, HistoryEntry, MockRun, AiReview, AppSettings } from '../lib/types'
 import { freshRecord, applyAttempt } from '../lib/scheduler'
 import { scoreAnswer, isAnswerBlank } from '../lib/scoring'
@@ -8,6 +8,11 @@ import type { Question } from '../lib/types'
 export interface SubmitOutcome {
   isCorrect: boolean | null
   blank: boolean
+}
+
+export interface SubmitOptions {
+  /** when true the attempt is NOT persisted (used by mock-exam blanks) */
+  skipPersistence?: boolean
 }
 
 interface StoreValue {
@@ -23,6 +28,7 @@ interface StoreValue {
     mode: string,
     sessionId: string,
     usedAI?: boolean,
+    options?: SubmitOptions,
   ) => Promise<SubmitOutcome>
   saveSubjectiveAttempt: (
     q: Question,
@@ -39,6 +45,14 @@ interface StoreValue {
   clearHistory: () => Promise<void>
   resetAllProgress: () => Promise<void>
   importRecords: (records: QRecord[], history: HistoryEntry[], mocks: MockRun[], aiReviews: AiReview[]) => Promise<void>
+  /** Full restore: records + history + mocks + aiReviews + settings, all-or-nothing. */
+  restoreBackup: (input: {
+    records: QRecord[]
+    history: HistoryEntry[]
+    mocks: MockRun[]
+    aiReviews: AiReview[]
+    settings: AppSettings | null
+  }) => Promise<void>
   clearWrong: (qids: string[]) => Promise<void>
 }
 
@@ -85,12 +99,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const getRecord = useCallback((qid: string) => records.get(qid), [records])
 
-  /** Persist a graded objective attempt. Blank answers are stored as wrong-but-not-correct. */
+  /**
+   * Persist a graded objective attempt.
+   *
+   * `blank` answers are reported distinctly from `wrong`: a blank is never
+   * counted as an error, and never lands in the wrong-question bank.
+   * With `options.skipPersistence` nothing is written at all (mock-exam blanks).
+   */
   const submitAnswer = useCallback<StoreValue['submitAnswer']>(
-    async (q, answer, mode, sessionId, usedAI = false) => {
+    async (q, answer, mode, sessionId, usedAI = false, options) => {
       const now = Date.now()
       const blank = isAnswerBlank(q, answer)
       const isCorrect = scoreAnswer(q, answer)
+      if (options?.skipPersistence) {
+        return { isCorrect, blank }
+      }
       const entry: HistoryEntry = {
         id: `h-${now}-${q.id}-${Math.random().toString(36).slice(2, 7)}`,
         qid: q.id,
@@ -198,6 +221,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           await db.mocks.bulkPut(mks)
           await db.aiReviews.bulkPut(aiv)
         })
+        await refresh()
+      },
+      /**
+       * Full backup restore. All-or-nothing: if any write fails the transaction
+       * aborts and the previous data stays intact, so a failed import can never
+       * leave a half-restored database.
+       */
+      restoreBackup: async ({ records: recs, history: hist, mocks: mks, aiReviews: aiv, settings: s }) => {
+        await restoreBackupInto(db, { records: recs, history: hist, mocks: mks, aiReviews: aiv, settings: s })
+        if (s) setSettings(s)
         await refresh()
       },
       clearWrong: async (qids: string[]) => {

@@ -77,3 +77,7 @@ tools/licence-audit.mjs
 tools/analyze-originality.mjs
 tools/classify-originality.mjs
 tools/verify-sample-originality.mjs
+
+# ---- commit message scratch ----
+.commitmsg
+.commit-msg.tmp

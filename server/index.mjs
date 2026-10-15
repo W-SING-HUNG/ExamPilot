@@ -7,14 +7,32 @@
  *   GET  /api/ai/status
  *   POST /api/ai/qa     { question, userAnswer, questionContext }
  *   POST /api/ai/grade  { qid, stem, userAnswer, chapter, kind }
+ *   POST /api/ai/config { baseUrl, apiKey, model, timeoutMs }   (local only, see ALLOW_CONFIG_WRITE)
  *
  * Never fabricates AI availability: when unconfigured it returns ok:false.
+ *
+ * Security boundary:
+ *   - Binds to 127.0.0.1 only (never 0.0.0.0), so the gateway key is not reachable
+ *     from other machines on the network.
+ *   - CORS allows only the local dev/preview origins, not `*`.
+ *   - The API key is never returned to the browser and never logged.
+ *   - /api/ai/config requires an allowed local Origin (or no Origin at all, i.e.
+ *     a direct local request such as curl); remote web pages cannot rewrite config.
  */
 import http from 'node:http'
 import { loadAiConfig, saveAiConfig, isConfigured } from './config.mjs'
 
 const PORT = Number(process.env.AI_PORT || 8787)
+const HOST = process.env.AI_HOST || '127.0.0.1'
 const cfg = await loadAiConfig()
+
+// Origins permitted to call this proxy. Vite dev/preview ports only.
+const ALLOWED_ORIGINS = new Set([
+  `http://localhost:5173`,
+  `http://127.0.0.1:5173`,
+  `http://localhost:4173`,
+  `http://127.0.0.1:4173`,
+])
 
 const DISCLAIMER = '本评阅由 AI 生成，仅作参考评阅，非官方标准答案或分数；请以题库原答案和课堂讲授为准。'
 
@@ -22,11 +40,27 @@ function send(res, status, obj) {
   const body = JSON.stringify(obj)
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
+    // Never expose the key or config to the browser
+    'Cache-Control': 'no-store',
   })
   res.end(body)
+}
+
+/** True when the request comes from an allowed local origin (or has no Origin). */
+function isTrustedOrigin(req) {
+  const origin = req.headers.origin
+  if (!origin) return true // curl / direct local request
+  return ALLOWED_ORIGINS.has(origin)
+}
+
+function applyCors(req, res) {
+  const origin = req.headers.origin
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Vary', 'Origin')
+  }
 }
 
 function readBody(req) {
@@ -172,29 +206,57 @@ function extractJson(text) {
   }
 }
 
-function normalizeGrade(raw) {
-  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : 0)
-  const list = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()) : [])
+/**
+ * Validate a grade result strictly. A missing or malformed field is a FAILURE,
+ * not a zero — we must never report `ok:true` with a fabricated score.
+ * Returns { ok: true, result } or { ok: false, reason }.
+ */
+function validateGrade(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, reason: 'AI 返回的评阅结果不是 JSON 对象' }
+  }
+  if (typeof raw.score !== 'number' || !Number.isFinite(raw.score)) {
+    return { ok: false, reason: 'AI 评阅结果缺少有效的 score 字段（数字）' }
+  }
+  if (raw.score < 0 || raw.score > 100) {
+    return { ok: false, reason: `AI 评阅 score 超出 0-100 范围：${raw.score}` }
+  }
+  for (const field of ['hitPoints', 'missedPoints', 'deductions', 'suggestions']) {
+    if (!Array.isArray(raw[field])) {
+      return { ok: false, reason: `AI 评阅结果缺少 ${field} 数组字段` }
+    }
+    if (raw[field].some((x) => typeof x !== 'string')) {
+      return { ok: false, reason: `AI 评阅结果 ${field} 含非字符串元素` }
+    }
+  }
+  if (typeof raw.structureNote !== 'string') {
+    return { ok: false, reason: 'AI 评阅结果缺少 structureNote 字符串字段' }
+  }
   return {
-    score: num(raw.score),
-    maxScore: 100,
-    hitPoints: list(raw.hitPoints),
-    missedPoints: list(raw.missedPoints),
-    deductions: list(raw.deductions),
-    suggestions: list(raw.suggestions),
-    structureNote: typeof raw.structureNote === 'string' ? raw.structureNote : '',
-    disclaimer: DISCLAIMER,
+    ok: true,
+    result: {
+      score: Math.round(raw.score),
+      maxScore: 100,
+      hitPoints: raw.hitPoints.filter((s) => s.trim()),
+      missedPoints: raw.missedPoints.filter((s) => s.trim()),
+      deductions: raw.deductions.filter((s) => s.trim()),
+      suggestions: raw.suggestions.filter((s) => s.trim()),
+      structureNote: raw.structureNote,
+      disclaimer: DISCLAIMER,
+    },
   }
 }
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`)
+  applyCors(req, res)
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    })
+    // Only echo CORS headers for trusted origins; otherwise a bare 204.
+    if (req.headers.origin && !ALLOWED_ORIGINS.has(req.headers.origin)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      return res.end(JSON.stringify({ ok: false, message: 'Origin not allowed' }))
+    }
+    res.writeHead(204)
     return res.end()
   }
 
@@ -213,6 +275,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && url.pathname === '/api/ai/config') {
+    // Config writes are restricted to trusted local origins: a remote web page
+    // must not be able to repoint this proxy at an attacker-controlled gateway.
+    if (!isTrustedOrigin(req)) {
+      return send(res, 403, { ok: false, message: '仅允许本地开发来源修改 AI 配置' })
+    }
     try {
       const body = JSON.parse((await readBody(req)) || '{}')
       const saved = await saveAiConfig({
@@ -244,23 +311,18 @@ const server = http.createServer(async (req, res) => {
       }
       const raw = extractJson(content)
       if (!raw) {
+        // Explicit failure — never fabricate a 0-score "successful" review
         return send(res, 200, {
-          ok: true,
-          result: {
-            score: 0,
-            maxScore: 100,
-            hitPoints: [],
-            missedPoints: [],
-            deductions: ['AI 未返回可解析的 JSON 评阅结果'],
-            suggestions: ['请重试，或改用人工对照教材自评'],
-            structureNote: content.slice(0, 400),
-            disclaimer: DISCLAIMER,
-          },
-          provider,
-          model,
+          ok: false,
+          reason: 'AI 未返回可解析的 JSON 评阅结果，本次评阅失败（未给出参考分）',
+          code: 'BAD_GRADE_FORMAT',
         })
       }
-      return send(res, 200, { ok: true, result: normalizeGrade(raw), provider, model })
+      const v = validateGrade(raw)
+      if (!v.ok) {
+        return send(res, 200, { ok: false, reason: v.reason, code: 'BAD_GRADE_FORMAT' })
+      }
+      return send(res, 200, { ok: true, result: v.result, provider, model })
     } catch (e) {
       const code = e.code || ''
       // Degrade gracefully: all failures surface as ok:false + reason, never a fabricated answer
@@ -272,7 +334,10 @@ const server = http.createServer(async (req, res) => {
   send(res, 404, { ok: false, message: 'Not found' })
 })
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`[ExamPilot AI proxy] listening on http://127.0.0.1:${PORT}`)
+server.listen(PORT, HOST, () => {
+  console.log(`[ExamPilot AI proxy] listening on http://${HOST}:${PORT}`)
   console.log(`[ExamPilot AI proxy] configured=${isConfigured(cfg)} model=${cfg.model || '(unset)'}`)
+  if (!isConfigured(cfg)) {
+    console.log('[ExamPilot AI proxy] 提示：AI 网关未配置；刷题、评分与本地记录不受影响。')
+  }
 })

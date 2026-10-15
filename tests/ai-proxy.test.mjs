@@ -1,7 +1,8 @@
 /**
  * AI proxy contract tests (node:test).
  * Covers: unconfigured, gateway HTTP error, success (QA), success (grade JSON),
- * malformed JSON, timeout, CORS, 404.
+ * malformed JSON, incomplete grade fields, timeout, CORS allow/deny, 404,
+ * config-write origin restriction, and key non-leakage.
  * Run: node tests/ai-proxy.test.mjs
  */
 import { test } from 'node:test'
@@ -98,6 +99,30 @@ const BAD_JSON_SCRIPT = `(req, res) => {
   res.end('not-json-at-all')
 }`
 
+// A grade response that is valid JSON but missing required fields.
+const INCOMPLETE_GRADE_SCRIPT = `(req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ score: 70 }) } }] }))
+}`
+
+// A grade response that is plain prose with no JSON at all.
+const GRADE_PLAIN_TEXT_SCRIPT = `(req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify({ choices: [{ message: { content: '这位同学答得不错，我给他 80 分吧。' } }] }))
+}`
+
+// A grade response whose score is not a number.
+const BAD_SCORE_SCRIPT = `(req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ score: 'high', hitPoints: [], missedPoints: [], deductions: [], suggestions: [], structureNote: 'x' }) } }] }))
+}`
+
+// A grade response with an out-of-range score.
+const OUT_OF_RANGE_SCRIPT = `(req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ score: 150, hitPoints: [], missedPoints: [], deductions: [], suggestions: [], structureNote: 'x' }) } }] }))
+}`
+
 test('AI proxy: unconfigured gateway', async (t) => {
   await startProxy()
   t.after(stopProxy)
@@ -127,9 +152,70 @@ test('AI proxy: unconfigured gateway', async (t) => {
 
   const nf = await fetch(`${BASE}/nope`)
   assert.equal(nf.status, 404)
-  const cors = await fetch(`${BASE}/api/ai/qa`, { method: 'OPTIONS' })
-  assert.equal(cors.status, 204)
-  assert.match(cors.headers.get('access-control-allow-origin'), /\*/)
+})
+
+test('AI proxy: CORS allows only local dev origins', async (t) => {
+  await startProxy()
+  t.after(stopProxy)
+
+  // allowed origin is echoed
+  const ok = await fetch(`${BASE}/api/ai/qa`, {
+    method: 'OPTIONS',
+    headers: { Origin: 'http://localhost:5173' },
+  })
+  assert.equal(ok.status, 204)
+  assert.equal(ok.headers.get('access-control-allow-origin'), 'http://localhost:5173')
+
+  // an arbitrary remote origin is rejected and gets no ACAO header
+  const bad = await fetch(`${BASE}/api/ai/qa`, {
+    method: 'OPTIONS',
+    headers: { Origin: 'https://evil.example.com' },
+  })
+  assert.equal(bad.status, 403)
+  assert.equal(bad.headers.get('access-control-allow-origin'), null)
+
+  // a plain GET from a foreign origin gets no ACAO header either
+  const statusRes = await fetch(`${BASE}/api/ai/status`, { headers: { Origin: 'https://evil.example.com' } })
+  assert.equal(statusRes.headers.get('access-control-allow-origin'), null)
+})
+
+test('AI proxy: config writes are restricted to trusted local origins', async (t) => {
+  await startProxy()
+  t.after(stopProxy)
+
+  // remote web page may not repoint the proxy
+  const denied = await fetch(`${BASE}/api/ai/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example.com' },
+    body: JSON.stringify({ baseUrl: 'https://evil.example.com/v1', apiKey: 'stolen', model: 'x' }),
+  })
+  assert.equal(denied.status, 403)
+  assert.equal((await denied.json()).ok, false)
+
+  // still unconfigured afterwards
+  const status = await (await fetch(`${BASE}/api/ai/status`)).json()
+  assert.equal(status.configured, false)
+})
+
+test('AI proxy: never returns the API key to the browser', async (t) => {
+  const stub = await startStub(8797, OK_SCRIPT)
+  await startProxy({ AI_BASE_URL: 'http://127.0.0.1:8797/v1', AI_API_KEY: 'super-secret-key-xyz', AI_MODEL: 'm' })
+  t.after(() => {
+    stopProxy()
+    stub.kill('SIGTERM')
+  })
+
+  const status = await (await fetch(`${BASE}/api/ai/status`)).text()
+  assert.ok(!status.includes('super-secret-key-xyz'), 'status must not leak the key')
+
+  const qa = await (
+    await fetch(`${BASE}/api/ai/qa`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: { stem: 'x' }, userAnswer: '' }),
+    })
+  ).text()
+  assert.ok(!qa.includes('super-secret-key-xyz'), 'qa response must not leak the key')
 })
 
 test('AI proxy: QA success proxies to gateway', async (t) => {
@@ -249,4 +335,59 @@ test('AI proxy: timeout -> ok:false with 超时 reason', async (t) => {
   assert.equal(j.ok, false)
   assert.match(j.reason, /超时/)
   assert.equal(j.answer, undefined)
+})
+
+// ---- strict grade validation: never fabricate a 0-score "success" ----
+
+async function gradeWithStub(t, port, script) {
+  const stub = await startStub(port, script)
+  await startProxy({ AI_BASE_URL: `http://127.0.0.1:${port}/v1`, AI_API_KEY: 'k', AI_MODEL: 'm' })
+  t.after(() => {
+    stopProxy()
+    stub.kill('SIGTERM')
+  })
+  const r = await fetch(`${BASE}/api/ai/grade`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ qid: 'Q1', stem: 'x', userAnswer: 'y', chapter: '导论', kind: 'short' }),
+  })
+  return { status: r.status, body: await r.json() }
+}
+
+test('AI proxy: grade with unparseable JSON -> ok:false (no fabricated 0)', async (t) => {
+  const { body } = await gradeWithStub(t, 8801, GRADE_PLAIN_TEXT_SCRIPT)
+  assert.equal(body.ok, false, 'must not report success with a fabricated score')
+  assert.equal(body.result, undefined)
+  assert.match(body.reason, /无法解析|未返回/)
+  assert.equal(body.code, 'BAD_GRADE_FORMAT')
+})
+
+test('AI proxy: grade missing required fields -> ok:false with a specific reason', async (t) => {
+  const { body } = await gradeWithStub(t, 8802, INCOMPLETE_GRADE_SCRIPT)
+  assert.equal(body.ok, false)
+  assert.equal(body.result, undefined)
+  assert.match(body.reason, /hitPoints|数组字段/)
+  assert.equal(body.code, 'BAD_GRADE_FORMAT')
+})
+
+test('AI proxy: grade with a non-numeric score -> ok:false', async (t) => {
+  const { body } = await gradeWithStub(t, 8803, BAD_SCORE_SCRIPT)
+  assert.equal(body.ok, false)
+  assert.match(body.reason, /score/)
+  assert.equal(body.code, 'BAD_GRADE_FORMAT')
+})
+
+test('AI proxy: grade with an out-of-range score -> ok:false', async (t) => {
+  const { body } = await gradeWithStub(t, 8804, OUT_OF_RANGE_SCRIPT)
+  assert.equal(body.ok, false)
+  assert.match(body.reason, /0-100/)
+  assert.equal(body.code, 'BAD_GRADE_FORMAT')
+})
+
+test('AI proxy: valid grade still succeeds with all fields', async (t) => {
+  const { status, body } = await gradeWithStub(t, 8805, GRADE_SCRIPT)
+  assert.equal(status, 200)
+  assert.equal(body.ok, true)
+  assert.equal(body.result.score, 82)
+  assert.equal(body.result.maxScore, 100)
 })
