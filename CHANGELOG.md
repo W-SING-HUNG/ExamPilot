@@ -7,20 +7,24 @@
 ### Added
 
 - 公开信息治理规范 `docs/information-governance.md`：信息分级（PUBLIC / INTERNAL / SECRET）、审查范围、推送前门禁与发布验收标准
-- 自动化门禁 `npm run check:public-info`（`tools/public-info-check.mjs`）：扫描受版本控制的文件与提交信息中的凭据特征、本地绝对路径、个人信息与内部研发记录；已纳入 CI
-- 历史暴露记录 `docs/history-exposure-report.md`：记录已确认的暴露范围、当前处置与**未执行**的历史清理方案
+- 自动化门禁 `npm run check:public-info`（`tools/public-info-check.mjs`）：按模式扫描文件内容、单独扫描提交元数据，并对禁止提交的文件路径实施硬阻断；已纳入 CI
+- 门禁回归测试 `npm run test:public-info`（`tests/public-info-check.test.mjs`，23 项）：覆盖凭据不落日志、各扫描模式、路径硬阻断与 `git add -f` 绕过
+- 历史暴露记录 `docs/history-exposure-report.md`：风险性质、影响范围、修复状态与历史残留
 
 ### Changed
 
 - `tools/extract.py`：移除硬编码的私人来源 PDF 文件名，改为命令行参数传入
 - `tools/parse_bank.py`：`source` 字段改为 `--source "<label>"` 参数，默认使用中性描述；解析逻辑与题库事实未改动
-- `CONTRIBUTING.md`：新增「公开信息治理」章节，提交前检查加入 `check:public-info`
-- PR 模板：新增公开信息合规检查项
-- CI：`quality` Job 增加公开信息检查；`actions/checkout` 使用 `fetch-depth: 0` 以扫描完整提交历史
+- 门禁输出改为**只报告规则 ID、路径与说明，不输出匹配到的原文**，避免把检测到的凭据或私人信息再次写入 CI 日志
+- 门禁明确区分四种扫描模式（暂存内容 / 工作区 / 指定提交 / 全部 ref 的 Blob），输出中注明实际范围，不再把提交元数据扫描表述为历史内容审计
+- 新增禁止提交路径的硬阻断（`data/bank.json`、`data/local-bank.json`、`src/lib/local-bank.generated.ts`、`tools/pdf_text.txt`、`server/ai-config.json`、真实 `.env`、私人来源 PDF 等），不依赖 `.gitignore`
+- `CONTRIBUTING.md`：新增「公开信息治理」章节与 Job 名称保护提示
+- PR 模板：新增公开信息合规检查项与门禁测试项
+- CI：`actions/checkout` 使用 `fetch-depth: 0`；`quality` Job 内新增公开信息检查与门禁测试**步骤**，**Job 名称保持不变**以兼容 `main` 的分支保护必需检查
 
 ### Security
 
-- 已知残留：上述文件名仍存在于历史提交与 `v0.1.0-beta` Tag 的工作树中，**未清除**；处理决定与代价见 `docs/history-exposure-report.md`
+- 已知残留：私人来源文档的文件名仍存在于历史提交与 `v0.1.0-beta` Tag 中，**未清除**，普通新提交无法清除；处理决定见 `docs/history-exposure-report.md`
 
 ## [0.1.0-beta] - 2026-10-15
 

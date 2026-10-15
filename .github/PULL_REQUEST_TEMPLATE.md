@@ -29,6 +29,7 @@ Closes #
 - [ ] `npm run lint`
 - [ ] `npm run format:check`
 - [ ] `npm run check:public-info`
+- [ ] `npm run test:public-info`
 - [ ] `npm test`
 - [ ] `npm run test:ai`
 - [ ] `npm run build`

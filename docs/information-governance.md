@@ -92,18 +92,37 @@
 
 ### 自动化检查
 
+工具：`tools/public-info-check.mjs`。**扫描内容与扫描提交元数据是两件不同的事，输出中分别报告。**
+
+| 模式 | 扫描的内容 | 适用场景 |
+| --- | --- | --- |
+| （默认）`--index` | **暂存区**中每个文件的完整内容 | 本地提交前检查将发布的内容 |
+| `--worktree` | 工作区文件内容 | 快速自查 |
+| `--commit <rev>` | 该提交树中每个文件的完整内容 | CI 检查实际提交内容 |
+| `--all-refs` | 所有 ref 可达的**去重 Blob** 内容 | 维护者全量审计 |
+
+各模式的输出会注明实际取得的内容范围与数量。**除 `--all-refs` 外，都不会扫描历史提交中的全部文件内容。**
+
+三种检查对象分别处理：
+
+- **当前/暂存内容**：默认检查暂存区，因此「暂存后修改工作区」不会造成漏检；CI 使用 `--commit "${{ github.sha }}"` 检查实际提交内容。
+- **提交元数据**：单独扫描提交信息，与内容扫描分开报告；可用 `--no-metadata` 关闭。
+- **禁止提交的文件路径**：`data/bank.json`、`data/local-bank.json`、`src/lib/local-bank.generated.ts`、`tools/pdf_text.txt`、`server/ai-config.json`、真实 `.env`、私人来源 PDF 等，**按路径硬阻断**。`.gitignore` 可被 `git add -f` 绕过，因此不依赖它。
+
+输出安全：命中项**只输出规则 ID、路径与规则说明，绝不输出匹配到的原文**，避免把检测到的凭据、私人路径或个人信息再次写入 CI 日志；路径本身匹配敏感规则时也会被遮蔽。
+
+严重级别：`SECRET` / `INTERNAL` 命中与禁止路径均使构建失败；`REVIEW` 级仅提示，需人工确认。
+
+**`--all-refs` 会报告已记录的历史残留。** 由于 [history-exposure-report.md](history-exposure-report.md) 中记录的历史暴露尚未清除，该模式会如实地以非零退出码报告这些历史 Blob。这是预期行为，不是配置错误；它是维护者诊断工具，不作为合并门禁。CI 使用的是 `--commit HEAD`，检查本次交付的实际内容。
+
+CI 中的执行步骤位于 `quality` Job 内（该 Job 名称是 `main` 分支保护的必需检查，不得重命名）：
+
 ```bash
-npm run check:public-info               # 受版本控制的文件 + 当前分支的提交历史
-node tools/public-info-check.mjs --all-refs   # 维护者全量审计：扫描所有 ref
+node tools/public-info-check.mjs --commit HEAD   # 实际提交内容（本次交付）
+npm run test:public-info                          # 门禁自身的回归测试
 ```
 
-该脚本扫描凭据特征、本地绝对路径、个人信息与内部研发记录。
-
-- **默认范围**：文件取自已暂存内容（即本次提交将公开的内容），历史取当前分支的祖先提交。这样 PR 的 CI 不会因其他分支的无关内容失败。
-- **`--all-refs`**：扩大到所有分支与 Tag，供维护者做全仓库审计。
-- **`REVIEW` 级提示**不阻断构建，但必须人工确认；`SECRET` / `INTERNAL` 级命中直接失败。
-
-`npm run check:public-info` 已纳入 CI 的 `quality` Job。**自动化检查只能发现已知模式，不能替代人工审查。**
+**自动化检查只能发现已知模式，不能替代人工审查；一次通过不构成安全保证。**
 
 ---
 

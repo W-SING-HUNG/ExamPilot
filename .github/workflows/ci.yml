@@ -16,10 +16,13 @@ concurrency:
 
 jobs:
   quality:
-    name: 类型检查 / Lint / 格式 / 公开信息 / 单元测试 / 生产构建
+    # NOTE: this job NAME is a required status check in main's branch protection.
+    # Renaming it would leave the required context unsatisfied and block merges.
+    # New checks must be added as STEPS inside this job, not by renaming it.
+    name: 类型检查 / Lint / 格式 / 单元测试 / 生产构建
     runs-on: ubuntu-latest
     steps:
-      # fetch-depth: 0 —— 公开信息门禁需要完整历史以扫描提交信息
+      # fetch-depth: 0 —— 公开信息门禁需要提交历史以扫描提交元数据
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -45,9 +48,18 @@ jobs:
       - name: Prettier 格式检查
         run: npm run format:check
 
-      # 公开信息门禁：凭据、本地路径、个人信息与内部记录（见 docs/information-governance.md）
+      # 公开信息门禁：凭据、本地路径、个人信息、内部记录与禁止提交的文件路径
+      # 见 docs/information-governance.md。
+      # 使用 HEAD（actions/checkout 已检出的提交）扫描**实际提交内容**，
+      # 而非工作区，避免暂存后修改工作区造成漏检；先回显 SHA 便于溯源核对。
       - name: 公开信息合规检查
-        run: npm run check:public-info
+        run: |
+          echo "inspecting commit: $(git rev-parse HEAD)"
+          node tools/public-info-check.mjs --commit HEAD
+
+      # 门禁自身的回归测试：证明检测有效且输出不含敏感原文
+      - name: 公开信息门禁测试
+        run: npm run test:public-info
 
       - name: 单元测试（公开示例题库）
         run: npm test

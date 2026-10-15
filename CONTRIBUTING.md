@@ -66,7 +66,8 @@ Closes #12
 npm run typecheck        # TypeScript 类型检查
 npm run lint             # ESLint
 npm run format:check     # Prettier 格式
-npm run check:public-info # 公开信息合规（凭据 / 本地路径 / 内部记录）
+npm run check:public-info # 公开信息合规（暂存内容 + 提交元数据 + 禁止路径）
+npm run test:public-info # 公开信息门禁自身的回归测试
 npm test                 # 单元测试（公开示例题库）
 npm run test:ai          # AI 代理契约测试
 npm run build            # 生产构建
@@ -95,9 +96,11 @@ npm run test:browser
 - 公开内容只包含产品功能、技术实现、可复现的测试结果与正式维护记录。
 - 不得写入本地绝对路径、私人文件名、个人邮箱或内部工作过程。
 - 描述验证结果时写明命令、范围与提交，不使用无证据的验收表述。
-- 提交前运行 `npm run check:public-info`；该检查已纳入 CI，命中即失败。
+- 提交前运行 `npm run check:public-info`（检查暂存内容、提交元数据与禁止提交的文件路径）；该检查已纳入 CI，命中即失败。
 
 已知的历史暴露问题及处理决定记录在 [docs/history-exposure-report.md](docs/history-exposure-report.md)。
+
+> **不要重命名 CI 的 Job 名称。** `main` 的分支保护要求三个特定检查名称，重命名会使必需检查缺失、阻塞合并。新增检查请作为 Job 内的**步骤**添加。
 
 ## 新增题库 schema 变更
 
