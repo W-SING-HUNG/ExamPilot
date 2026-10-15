@@ -1,7 +1,9 @@
 import { execSync } from 'node:child_process'
 
 const files = execSync('git diff --cached --name-only --diff-filter=ACM', { encoding: 'utf8' })
-  .split('\n').map((s) => s.trim()).filter(Boolean)
+  .split('\n')
+  .map((s) => s.trim())
+  .filter(Boolean)
 
 const patterns = [
   ['API key prefix', /sk-[a-zA-Z0-9]{16,}/],
@@ -17,7 +19,11 @@ const patterns = [
 let hits = 0
 for (const f of files) {
   let content = ''
-  try { content = execSync(`git show ":${f}"`, { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 }) } catch { continue }
+  try {
+    content = execSync(`git show ":${f}"`, { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 })
+  } catch {
+    continue
+  }
   for (const [name, re] of patterns) {
     const m = content.match(re)
     if (m) {

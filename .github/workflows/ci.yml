@@ -23,11 +23,15 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '22'
           cache: npm
 
       - name: 安装锁定版本依赖
         run: npm ci
+
+      # 生成本地题库加载器：CI 无私人题库，将写入 null 加载器（公开示例题库模式）
+      - name: 生成题库加载器
+        run: npm run bank:local
 
       - name: TypeScript 类型检查
         run: npm run typecheck
@@ -52,11 +56,14 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '22'
           cache: npm
 
       - name: 安装锁定版本依赖
         run: npm ci
+
+      - name: 生成题库加载器（公开示例题库模式）
+        run: npm run bank:local
 
       - name: AI 代理契约测试
         run: npm run test:ai
@@ -69,11 +76,14 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '22'
           cache: npm
 
       - name: 安装锁定版本依赖
         run: npm ci
+
+      - name: 生成题库加载器（公开示例题库模式）
+        run: npm run bank:local
 
       - name: 安装 Chrome
         run: |
@@ -82,12 +92,12 @@ jobs:
 
       - name: 启动开发服务器
         run: |
-          npm run dev &
+          npm run dev > vite.log 2>&1 &
           for i in $(seq 1 60); do
             if curl -sf http://localhost:5173/ > /dev/null; then echo "dev server ready"; exit 0; fi
             sleep 1
           done
-          echo "dev server failed to start"; exit 1
+          echo "dev server failed to start"; cat vite.log; exit 1
 
       - name: 浏览器 E2E（公开示例题库）
         run: npm run test:browser
@@ -98,7 +108,7 @@ jobs:
       - name: 失败时上传诊断日志
         if: failure()
         run: |
-          echo "----- vite log -----"
-          cat nohup.out 2>/dev/null || true
+          echo "----- vite.log -----"
+          cat vite.log 2>/dev/null || true
           echo "----- dev server probe -----"
           curl -sS -o /dev/null -w "%{http_code}\n" http://localhost:5173/ || true

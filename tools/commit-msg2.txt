@@ -1,0 +1,19 @@
+ci: 在 CI 中生成题库加载器并修正 E2E 配置
+
+问题：src/lib/local-bank.generated.ts 被 .gitignore 忽略，干净检出中不存在，
+导致 CI 的 TypeScript 检查与 Vite 预转换失败。
+
+修复
+- 三个 job 在依赖安装后先执行 npm run bank:local
+  （CI 无私人题库时写入 null 加载器，进入公开示例题库模式）
+- browser-e2e：dev server 日志重定向到 vite.log，失败时输出，便于诊断
+- browser-e2e：E2E 通过 CHROME_PATH 环境变量定位 Chrome，支持 Linux runner
+- Node 20 -> 22（20 已在 runner 上弃用）
+
+新增
+- .github/dependabot.yml：npm 与 GitHub Actions 依赖每周/每月更新
+- tools/ 下 GitHub API 辅助脚本（推送、远程校验、CI 日志）
+
+验证（本地）
+- typecheck / lint / format:check / unit(36) / build 全部通过
+- 公开示例题库模式下 browser E2E 14/14 通过

@@ -55,3 +55,7 @@ test-results/
 tools/.gh_token
 tools/staged.txt
 scratch/
+
+# ---- transient CI/API artifacts ----
+tools/*.json
+tools/ci-job-*.log
