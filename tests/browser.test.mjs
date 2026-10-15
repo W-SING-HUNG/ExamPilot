@@ -873,14 +873,22 @@ test('browser E2E', async (t) => {
 
       const body = await p.evaluate(() => document.body.textContent)
       assert.match(body, /题库不一致/, 'mismatch is surfaced')
-      assert.match(body, /没有可导入的学习进度|防串题污染/, 'explains why progress cannot be migrated')
+      assert.match(body, /防串题污染|单独恢复偏好设置/, 'explains why progress cannot be migrated')
 
-      // Confirm is blocked because there is no verified data to import
-      const disabled = await p.evaluate(() => {
+      // Switch to replace mode: since study progress is unverified, replace is blocked to protect existing data
+      await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) =>
+          x.textContent.includes('替换（清空后写入）'),
+        )
+        b?.click()
+      })
+      await new Promise((r) => setTimeout(r, 300))
+
+      const disabledInReplace = await p.evaluate(() => {
         const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
         return b ? b.disabled : null
       })
-      assert.equal(disabled, true, 'confirm is blocked when fingerprint mismatches without verified bindings')
+      assert.equal(disabledInReplace, true, 'replace mode is blocked when study progress is unverified')
 
       // Cancel must leave the DB untouched
       await p.evaluate(() => {
@@ -906,7 +914,7 @@ test('browser E2E', async (t) => {
     await p.evaluate(async () => {
       const m = await import('/src/lib/io.ts')
       const payload = m.makeExportPayload({
-        settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
+        settings: undefined,
         records: [
           {
             qid: 'ghost-1',
@@ -937,7 +945,7 @@ test('browser E2E', async (t) => {
     const body = await p.evaluate(() => document.body.textContent)
     assert.match(
       body,
-      /没有可导入的学习进度|没有任何数据能对应到当前题库/,
+      /没有可导入的学习进度|没有任何数据能对应到当前题库|没有可导入的内容/,
       'the reason is explained, not a silent deadlock',
     )
     assert.match(body, /没有可导入的数据|没有可导入的内容/)
@@ -963,6 +971,106 @@ test('browser E2E', async (t) => {
     assert.equal(count, 0, 'cancel writes nothing')
     await ctx.close()
   })
+
+  await t.test(
+    'UI: backup with mismatched bank but valid settings allows independent settings recovery in merge mode',
+    async () => {
+      const { p, ctx } = await freshPage()
+      await nav(p, 'io')
+      await p.waitForSelector('.page-title')
+
+      await p.evaluate(async () => {
+        const m = await import('/src/lib/io.ts')
+        const payload = m.makeExportPayload({
+          settings: { theme: 'dark', reviewIntervalBase: 4, studyTarget: 40, dailyGoalQuestions: 40 },
+          records: [
+            {
+              qid: 'mismatch-q1',
+              status: 'learning',
+              attempts: 3,
+              correctCount: 2,
+              wrongCount: 1,
+              lastSeenAt: 10,
+              lastCorrect: true,
+              lastAnswer: 'A',
+              intervalDays: 1,
+              ease: 2,
+              nextReviewAt: 1,
+            },
+          ],
+          history: [],
+          mocks: [],
+          aiReviews: [],
+          bankFingerprint: 'completely-different-bank',
+          bankCount: 10,
+        })
+        globalThis.__backupText = m.serialize(payload)
+      })
+
+      const text = await p.evaluate(() => globalThis.__backupText)
+      await uploadBackup(p, 'settings-only.json', text)
+      await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+      const body = await p.evaluate(() => document.body.textContent)
+      assert.match(body, /可单独恢复偏好设置/, 'explains settings can be recovered in merge mode')
+
+      // Confirm button is NOT blocked in merge mode
+      const disabledInMerge = await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+        return b ? b.disabled : null
+      })
+      assert.equal(disabledInMerge, false, 'merge mode allows confirming settings recovery')
+
+      // Now switch to replace mode: replace mode MUST be blocked to prevent accidental wipe of progress
+      await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) =>
+          x.textContent.includes('替换（清空后写入）'),
+        )
+        b?.click()
+      })
+      await new Promise((r) => setTimeout(r, 300))
+
+      const disabledInReplace = await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+        return b ? b.disabled : null
+      })
+      assert.equal(disabledInReplace, true, 'replace mode is blocked when study data cannot be safely verified')
+
+      const bodyReplace = await p.evaluate(() => document.body.textContent)
+      assert.match(bodyReplace, /已禁止替换导入/, 'explains replace is blocked to prevent accidental wipe')
+
+      // Switch back to merge and confirm
+      await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) =>
+          x.textContent.includes('合并（同 ID 以备份为准）'),
+        )
+        b?.click()
+      })
+      await new Promise((r) => setTimeout(r, 300))
+
+      await p.evaluate(() => {
+        Array.from(document.querySelectorAll('.btn'))
+          .find((x) => x.textContent.trim() === '确认导入')
+          ?.click()
+      })
+      await p.waitForFunction(() => document.body.textContent.includes('导入完成'), { timeout: 15000 })
+
+      // Verify DB: settings applied, but 0 records imported (preventing cross-bank corruption)
+      const after = await p.evaluate(async () => {
+        const dbmod = await import('/src/db/database.ts')
+        const snap = await dbmod.snapshotDb(dbmod.db)
+        return {
+          recordsCount: snap.records.length,
+          settings: snap.settings,
+        }
+      })
+      assert.equal(after.recordsCount, 0, 'no unverified records imported')
+      assert.equal(after.settings?.theme, 'dark', 'settings successfully applied')
+      assert.equal(after.settings?.studyTarget, 40, 'settings values successfully applied')
+
+      await ctx.close()
+    },
+  )
 
   await t.test('UI: a legacy backup without a fingerprint warns and blocks unverified progress', async () => {
     const { p, ctx } = await freshPage()
@@ -1345,69 +1453,224 @@ test('browser E2E', async (t) => {
     await ctx.close()
   })
 
-  // ---- Plan session ID stability -------------------------------------------
+  // ---- Plan session ID stability & AI review non-duplication ----------------
 
   await t.test(
-    'plan: session ID is generated on session start and remains stable across answers and re-renders',
+    'plan: session ID is generated on session start, stays stable across answers and re-renders, and AI review shares session ID without duplicate attempts',
     async () => {
+      // 1. Start a local mock gateway to serve AI grade without spending real quota or network
+      const http = await import('node:http')
+      const mockPort = 8815
+      const mockServer = http.createServer((req, res) => {
+        let body = ''
+        req.on('data', (chunk) => {
+          body += chunk
+        })
+        req.on('end', () => {
+          if (req.url?.includes('/ai/grade')) {
+            res.writeHead(200, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type',
+            })
+            res.end(
+              JSON.stringify({
+                ok: true,
+                provider: 'mock-stub',
+                model: 'mock-model',
+                result: {
+                  score: 85,
+                  maxScore: 100,
+                  hitPoints: ['答出核心要点'],
+                  missedPoints: [],
+                  deductions: [],
+                  suggestions: ['继续保持'],
+                  structureNote: '逻辑层次分明',
+                  disclaimer: '模拟测试评阅',
+                },
+              }),
+            )
+            return
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+          res.end(JSON.stringify({ ok: true }))
+        })
+      })
+      await new Promise((resolve) => mockServer.listen(mockPort, '127.0.0.1', resolve))
+
       const { p, ctx } = await freshPage()
+
+      // Set localStorage to point frontend AI requests directly to our mock server
+      await p.evaluate((port) => {
+        localStorage.setItem(
+          'exampilot.ai.config',
+          JSON.stringify({
+            baseUrl: `http://127.0.0.1:${port}`,
+            model: 'mock-model',
+            timeoutMs: 5000,
+          }),
+        )
+      }, mockPort)
+
+      // Seed one subjective question and one objective question into IndexedDB as due review
+      const seeded = await p.evaluate(async () => {
+        const bankMod = await import('/src/lib/bank.ts')
+        const dbmod = await import('/src/db/database.ts')
+        const subjQ = bankMod.allQuestions.find((q) => q.type === 'short' || q.type === 'material')
+        const objQ = bankMod.allQuestions.find((q) => q.type === 'single')
+        if (subjQ) {
+          await dbmod.db.records.put({
+            qid: subjQ.id,
+            status: 'learning',
+            attempts: 1,
+            correctCount: 0,
+            wrongCount: 0,
+            lastSeenAt: 100,
+            lastCorrect: null,
+            lastAnswer: '旧作答',
+            intervalDays: 1,
+            ease: 1,
+            nextReviewAt: 100,
+          })
+        }
+        if (objQ) {
+          await dbmod.db.records.put({
+            qid: objQ.id,
+            status: 'learning',
+            attempts: 1,
+            correctCount: 1,
+            wrongCount: 0,
+            lastSeenAt: 100,
+            lastCorrect: true,
+            lastAnswer: 'A',
+            intervalDays: 1,
+            ease: 1,
+            nextReviewAt: 100,
+          })
+        }
+        return { subjQid: subjQ?.id, objQid: objQ?.id }
+      })
+      assert.ok(seeded.subjQid, 'found a subjective question in bank to test')
+
       await nav(p, 'plan')
       await p.waitForSelector('.page-title')
 
-      // Find and click the button to start plan review
-      const started = await p.evaluate(() => {
+      // Must find and click the button to start plan review
+      await p.waitForSelector('button.btn-primary.btn-lg', { timeout: 10000 })
+      const startClicked = await p.evaluate(() => {
         const btns = Array.from(document.querySelectorAll('button'))
-        const startBtn = btns.find((b) => b.textContent.includes('开始今日复习'))
+        const startBtn = btns.find((b) => b.textContent?.includes('开始今日复习'))
         if (startBtn) {
           startBtn.click()
           return true
         }
         return false
       })
+      assert.equal(startClicked, true, 'must click 开始今日复习 to start session')
 
-      if (started) {
+      await p.waitForSelector('.q-stem', { timeout: 10000 })
+
+      // Helper to answer and submit currently displayed question
+      async function answerAndSubmit(ansText) {
         await p.waitForSelector('.q-stem', { timeout: 10000 })
-
-        // Select an option
-        await p.evaluate(() => {
-          const opts = document.querySelectorAll('.opt')
-          if (opts.length > 0) {
-            opts[0].click()
+        const isSubj = await p.evaluate((text) => {
+          const ta = document.querySelector('textarea')
+          if (ta) {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+            setter?.call(ta, text)
+            ta.dispatchEvent(new Event('input', { bubbles: true }))
+            return true
           }
-        })
+          const opt = document.querySelector('.opt')
+          if (opt) {
+            opt.click()
+            return false
+          }
+          const jb = document.querySelector('.judge-btn')
+          if (jb) jb.click()
+          return false
+        }, ansText)
 
-        // Submit the answer
+        // Submit
         await p.evaluate(() => {
           const btns = Array.from(document.querySelectorAll('button'))
-          const submitBtn = btns.find((b) => b.textContent.includes('提交') || b.textContent.includes('确认'))
-          if (submitBtn) submitBtn.click()
+          const submitBtn = btns.find((b) => b.textContent?.includes('确认') || b.textContent?.includes('提交'))
+          submitBtn?.click()
         })
-
         await new Promise((r) => setTimeout(r, 600))
 
-        // Check IndexedDB history records created for this plan session
-        const historyStats = await p.evaluate(async () => {
-          const dbmod = await import('/src/db/database.ts')
-          const allHistory = await dbmod.db.history.toArray()
-          const planHistory = allHistory.filter((h) => h.mode === 'plan')
-          const sessionIds = Array.from(new Set(planHistory.map((h) => h.sessionId)))
-          return {
-            count: planHistory.length,
-            uniqueSessionIds: sessionIds.length,
-            sessionIds,
+        if (isSubj) {
+          // Trigger AI review
+          const gradeBtn = await p.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('button'))
+            const b = btns.find(
+              (btn) => btn.textContent?.includes('AI 参考评阅') || btn.textContent?.includes('AI 评阅'),
+            )
+            if (b) {
+              b.click()
+              return true
+            }
+            return false
+          })
+          if (gradeBtn) {
+            await p.waitForFunction(() => document.body.textContent?.includes('已保存'), { timeout: 8000 })
           }
-        })
+        }
 
-        if (historyStats.count > 0) {
+        return isSubj
+      }
+
+      // Answer question 1
+      await answerAndSubmit('主观题第一题作答内容')
+
+      // Click Next
+      await p.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button'))
+        const nextBtn = btns.find((b) => b.textContent?.includes('下一题'))
+        nextBtn?.click()
+      })
+      await new Promise((r) => setTimeout(r, 600))
+
+      // Answer question 2
+      await answerAndSubmit('主观题第二题作答内容')
+
+      // Assert at least 2 real answers persisted in IndexedDB under mode 'plan'
+      const stats = await p.evaluate(async () => {
+        const dbmod = await import('/src/db/database.ts')
+        const allHistory = await dbmod.db.history.toArray()
+        const planHistory = allHistory.filter((h) => h.mode === 'plan')
+        const sessionIds = Array.from(new Set(planHistory.map((h) => h.sessionId)))
+        const records = await dbmod.db.records.toArray()
+        return {
+          historyCount: planHistory.length,
+          uniqueSessionIds: sessionIds.length,
+          sessionIds,
+          planHistory,
+          records,
+        }
+      })
+
+      assert.ok(stats.historyCount >= 2, `must have at least 2 answer submissions persisted, got ${stats.historyCount}`)
+      assert.equal(
+        stats.uniqueSessionIds,
+        1,
+        `all submissions in this plan session must share exactly 1 stable sessionId, got ${JSON.stringify(stats.sessionIds)}`,
+      )
+      assert.ok(stats.sessionIds[0].startsWith('s-'), 'sessionId format is stable s-...')
+
+      // Verify that if the seeded subjective question was submitted and AI reviewed, its attempts count was not duplicated
+      if (seeded.subjQid) {
+        const subjRecord = stats.records.find((r) => r.qid === seeded.subjQid)
+        if (subjRecord && stats.planHistory.some((h) => h.qid === seeded.subjQid)) {
           assert.equal(
-            historyStats.uniqueSessionIds,
-            1,
-            'all plan question submissions in session share exactly 1 stable sessionId',
+            subjRecord.attempts,
+            2,
+            'subjective question attempt is not duplicated by AI review in same session',
           )
-          assert.ok(historyStats.sessionIds[0].startsWith('s-'), 'sessionId format is stable s-...')
         }
       }
 
+      mockServer.close()
       await ctx.close()
     },
   )

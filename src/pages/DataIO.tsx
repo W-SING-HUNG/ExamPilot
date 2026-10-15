@@ -177,9 +177,25 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
 
   const f = preview?.plan.filter
   const excludedTotal = f ? f.excludedRecords + f.excludedHistory + f.excludedMocks + f.excludedAiReviews : 0
-  const nothingToImport = f ? f.nothingVerifiable : false
+  const isFingerprintMatch = preview?.bankCheck.status === 'match'
+  const hasVerifiableStudyData = f
+    ? f.keptRecords > 0 || f.keptHistory > 0 || f.keptMocks > 0 || f.keptAiReviews > 0
+    : true
+  const hasRecoverableSettings = preview
+    ? preview.plan.settingsAction === 'set' && preview.plan.settings !== null
+    : false
+  const canImport = isFingerprintMatch
+    ? f
+      ? !f.nothingVerifiable || hasRecoverableSettings
+      : true
+    : hasVerifiableStudyData || (mode === 'merge' && hasRecoverableSettings)
+
+  // Replace mode is disallowed if cross-bank progress is unverified,
+  // to avoid accidentally clearing existing progress just to apply settings.
+  const replaceBlocked = mode === 'replace' && !isFingerprintMatch && !hasVerifiableStudyData
+  const needsOverwriteAck = mode === 'replace' && !overwriteAck
   const needsLegacyAck = preview?.bankCheck.status === 'unknown' && !legacyAck
-  const confirmBlocked = (mode === 'replace' && !overwriteAck) || needsLegacyAck || nothingToImport
+  const confirmBlocked = !canImport || replaceBlocked || needsOverwriteAck || needsLegacyAck
 
   return (
     <>
@@ -284,25 +300,39 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
             {preview.bankCheck.message}
           </div>
 
-          {nothingToImport && (
-            <div className="result-banner bad" style={{ marginBottom: 10 }}>
-              备份与当前题库不一致，且未包含可安全验证的数据，因此<b>没有可导入的学习进度</b>。
-              为避免题目混淆与学习数据串题污染，系统已阻止导入。请使用与当前题库匹配的备份。
+          {!hasVerifiableStudyData && hasRecoverableSettings && mode === 'merge' && (
+            <div className="result-banner warn" style={{ marginBottom: 10 }}>
+              备份与当前题库不一致或缺乏完整题目绑定证明，未经验证的学习数据已安全排除，以防串题污染统计。由于备份包含有效偏好设置，在合并模式下
+              <b>可单独恢复偏好设置</b>（当前学习数据保持不变）。
             </div>
           )}
 
-          {preview.bankCheck.status === 'mismatch' && !nothingToImport && (
+          {!hasVerifiableStudyData && hasRecoverableSettings && mode === 'replace' && (
+            <div className="result-banner bad" style={{ marginBottom: 10 }}>
+              备份未包含可安全验证的学习进度。为防止替换模式意外清空您现有的学习数据，<b>已禁止替换导入</b>
+              。如需仅恢复设置，请切换至「合并」模式。
+            </div>
+          )}
+
+          {!hasVerifiableStudyData && !hasRecoverableSettings && (
+            <div className="result-banner bad" style={{ marginBottom: 10 }}>
+              备份与当前题库不一致或没有任何数据能对应到当前题库，且未包含可恢复的有效学习数据或偏好设置，因此
+              <b>没有可导入的内容</b>。请使用与当前题库匹配的备份。
+            </div>
+          )}
+
+          {preview.bankCheck.status === 'mismatch' && hasVerifiableStudyData && (
             <div className="result-banner warn" style={{ marginBottom: 10 }}>
               备份来自不同题库（指纹不一致）。由于题目选项与答案绑定无法保证一致，未经验证的学习记录与历史已自动排除，以防串题污染统计。
             </div>
           )}
-          {preview.bankCheck.status === 'unknown' && !nothingToImport && (
+          {preview.bankCheck.status === 'unknown' && (
             <div className="result-banner warn" style={{ marginBottom: 10 }}>
-              这是旧版备份（缺少完整题库指纹），缺乏题目—选项—答案绑定证明。为保证当前学习统计真实，无法直接导入学习记录与历史。
+              这是旧版备份（缺少完整题库指纹），缺乏题目—选项—答案绑定证明。为保证当前学习统计真实，无法确认题目是否一致，学习记录与历史已安全隔离。
             </div>
           )}
 
-          {excludedTotal > 0 && !nothingToImport && (
+          {excludedTotal > 0 && hasVerifiableStudyData && (
             <div className="result-banner warn" style={{ marginBottom: 10 }}>
               已安全排除 {excludedTotal} 条未通过题库一致性验证的数据： 学习记录 {f?.excludedRecords}、历史{' '}
               {f?.excludedHistory}、 模拟考试 {f?.excludedMocks}、AI 评阅 {f?.excludedAiReviews}。
@@ -370,12 +400,10 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
               <span className="muted">我确认要用备份替换现有全部学习数据（现有数据将被删除，且不可撤销）</span>
             </label>
           )}
-          {preview.bankCheck.status === 'unknown' && !nothingToImport && (
+          {preview.bankCheck.status === 'unknown' && (
             <label className="row" style={{ gap: 8, marginBottom: 8 }}>
               <input type="checkbox" checked={legacyAck} onChange={(e) => setLegacyAck(e.target.checked)} />
-              <span className="muted">
-                我确认这是缺少指纹的旧版备份，了解题库完整绑定无法验证的风险，仅导入偏好设置及AI评阅记录
-              </span>
+              <span className="muted">我确认这是缺少指纹的旧版备份，了解无法确认题目是否一致的风险</span>
             </label>
           )}
 
@@ -386,9 +414,14 @@ export function DataIO({ params: _params }: { params: Record<string, string> }) 
             <button className="btn" onClick={cancelPreview} disabled={busy}>
               取消
             </button>
-            {mode === 'replace' && !overwriteAck && <span className="muted-2">请先勾选替换确认</span>}
+            {mode === 'replace' && !isFingerprintMatch && !hasVerifiableStudyData && hasRecoverableSettings && (
+              <span className="muted-2">替换模式已禁止（防止清空现有进度），请切至合并模式</span>
+            )}
+            {mode === 'replace' && (isFingerprintMatch || hasVerifiableStudyData) && !overwriteAck && (
+              <span className="muted-2">请先勾选替换确认</span>
+            )}
             {needsLegacyAck && <span className="muted-2">请先勾选旧版备份风险确认</span>}
-            {nothingToImport && <span className="muted-2">没有可导入的数据</span>}
+            {!canImport && <span className="muted-2">没有可导入的数据</span>}
           </div>
         </CardPad>
       )}

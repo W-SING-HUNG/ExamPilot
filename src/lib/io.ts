@@ -605,11 +605,11 @@ export function filterPayloadToBank(
   fingerprintMatch: boolean = false,
 ): { payload: ExportPayload; report: BankFilterReport } {
   // If fingerprint matches completely, we verify membership in the current bank question IDs.
-  // If fingerprint differs or is unknown, question records and history have no content proof,
+  // If fingerprint differs or is unknown, question records, history, and AI reviews have no content proof,
   // so they cannot be migrated to the active database.
   const records = fingerprintMatch ? payload.records.filter((r) => bankQuestionIds.has(r.qid)) : []
   const history = fingerprintMatch ? payload.history.filter((h) => bankQuestionIds.has(h.qid)) : []
-  const aiReviews = payload.aiReviews.filter((a) => bankQuestionIds.has(a.qid))
+  const aiReviews = fingerprintMatch ? payload.aiReviews.filter((a) => bankQuestionIds.has(a.qid)) : []
   const mocks = payload.mocks.filter(
     (m) => fingerprintMatch && Object.keys(m.submissions ?? {}).every((qid) => bankQuestionIds.has(qid)),
   )

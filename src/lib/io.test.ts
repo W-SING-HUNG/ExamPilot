@@ -543,4 +543,58 @@ describe('io / filterPayloadToBank', () => {
     expect(plan.history).toHaveLength(0)
     expect(plan.filter.excludedRecords).toBe(1)
   })
+
+  it('REGRESSION: AI reviews are excluded when bank fingerprint does not match (preventing wrong association & overwrite)', () => {
+    const p = payload({
+      aiReviews: [mkai('a1', 'q1')],
+      bankFingerprint: 'different-fingerprint-cross-bank',
+    })
+    const existingAi = mkai('a1-local', 'q1')
+    existingAi.result.score = 99
+    const existing: ExistingData = {
+      ...emptyExisting,
+      aiReviews: [existingAi],
+    }
+
+    const plan = planImport(p, 'merge', existing, new Set(['q1']), false)
+    // The incoming AI review must NOT be kept because its question binding cannot be proven
+    expect(plan.aiReviews).toHaveLength(1)
+    expect(plan.aiReviews[0].id).toBe('a1-local')
+    expect(plan.aiReviews[0].result.score).toBe(99)
+    expect(plan.filter.excludedAiReviews).toBe(1)
+  })
+
+  it('REGRESSION: valid settings are preserved and can be restored independently in merge mode even if study data is excluded', () => {
+    const customSettings = {
+      theme: 'dark' as const,
+      reviewIntervalBase: 5,
+      studyTarget: 50,
+      dailyGoalQuestions: 50,
+    }
+    const p = payload({
+      records: [mkre('q1', 3)],
+      history: [mkhist('h1', 'q1')],
+      settings: customSettings,
+      bankFingerprint: 'mismatched-bank-fingerprint',
+    })
+
+    const existingSettings = {
+      theme: 'light' as const,
+      reviewIntervalBase: 1,
+      studyTarget: 20,
+      dailyGoalQuestions: 20,
+    }
+    const existing: ExistingData = {
+      ...emptyExisting,
+      settings: existingSettings,
+    }
+
+    // Merge mode: study data excluded due to fingerprint mismatch, but settings are valid and can be applied!
+    const plan = planImport(p, 'merge', existing, new Set(['q1']), false)
+    expect(plan.records).toHaveLength(0)
+    expect(plan.history).toHaveLength(0)
+    expect(plan.settings).toEqual(customSettings)
+    expect(plan.settingsAction).toBe('set')
+    expect(plan.filter.excludedRecords).toBe(1)
+  })
 })
