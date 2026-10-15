@@ -55,9 +55,25 @@ test-results/
 tools/.gh_token
 tools/staged.txt
 scratch/
+tools/commit-msg*.txt
 
 # ---- transient CI/API artifacts ----
 tools/*.json
 tools/ci-job-*.log
 
+# ---- Local-only tooling (needs the private course bank or a GitHub token) ----
+# These are release/audit helpers used by the maintainer; they are not part of
+# the public contribution workflow and would fail in a clean checkout.
 tools/list-jobs.mjs
+tools/gh-api.mjs
+tools/push-via-api.mjs
+tools/ci-logs.mjs
+tools/secret-scan.mjs
+tools/verify-remote.mjs
+tools/history-scan.mjs
+tools/check-bank.mjs
+tools/bump-version.mjs
+tools/licence-audit.mjs
+tools/analyze-originality.mjs
+tools/classify-originality.mjs
+tools/verify-sample-originality.mjs
