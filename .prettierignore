@@ -6,3 +6,4 @@ src/lib/local-bank.generated.ts
 package-lock.json
 *.md
 tools/.clean-checkout/
+tools/.e2e-uploads/

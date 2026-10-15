@@ -77,3 +77,10 @@ tools/licence-audit.mjs
 tools/analyze-originality.mjs
 tools/classify-originality.mjs
 tools/verify-sample-originality.mjs
+
+# ---- Python caches (local parse tooling) ----
+__pycache__/
+*.pyc
+
+# ---- E2E upload scratch ----
+tools/.e2e-uploads/

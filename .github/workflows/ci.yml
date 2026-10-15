@@ -16,10 +16,13 @@ concurrency:
 
 jobs:
   quality:
-    name: 类型检查 / Lint / 格式 / 单元测试 / 生产构建
+    name: 类型检查 / Lint / 格式 / 公开信息 / 单元测试 / 生产构建
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 —— 公开信息门禁需要完整历史以扫描提交信息
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -41,6 +44,10 @@ jobs:
 
       - name: Prettier 格式检查
         run: npm run format:check
+
+      # 公开信息门禁：凭据、本地路径、个人信息与内部记录（见 docs/information-governance.md）
+      - name: 公开信息合规检查
+        run: npm run check:public-info
 
       - name: 单元测试（公开示例题库）
         run: npm test

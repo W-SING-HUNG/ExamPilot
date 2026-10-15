@@ -28,6 +28,7 @@ Closes #
 - [ ] `npm run typecheck`
 - [ ] `npm run lint`
 - [ ] `npm run format:check`
+- [ ] `npm run check:public-info`
 - [ ] `npm test`
 - [ ] `npm run test:ai`
 - [ ] `npm run build`
@@ -53,6 +54,13 @@ Closes #
 - [ ] 未虚构题库答案、掌握率或预测成绩
 - [ ] 新增脚本已在 `package.json` 中登记，CI 可调用
 - [ ] 如为破坏性变更，已更新 CHANGELOG
+
+### 公开信息治理（见 [docs/information-governance.md](../docs/information-governance.md)）
+
+- [ ] PR 标题、描述、提交信息与代码注释中不含本地绝对路径、私人文件名或个人身份信息
+- [ ] 不含无证据的验收表述；验证结论已写明命令与提交
+- [ ] 未引入需要隐藏的内部研发记录
+- [ ] `npm run check:public-info` 通过，且已对新增文字完成人工复核
 
 ## 截图（如涉及 UI）
 

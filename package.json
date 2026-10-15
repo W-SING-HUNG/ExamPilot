@@ -18,6 +18,7 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "check:public-info": "node tools/public-info-check.mjs",
     "parse:bank": "py -X utf8 tools/parse_bank.py",
     "bank:local": "node tools/bank-local.mjs"
   },

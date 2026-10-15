@@ -63,12 +63,13 @@ Closes #12
 ## 本地检查（提交前必跑）
 
 ```bash
-npm run typecheck     # TypeScript 类型检查
-npm run lint          # ESLint
-npm run format:check  # Prettier 格式
-npm test              # 单元测试（公开示例题库）
-npm run test:ai       # AI 代理契约测试
-npm run build         # 生产构建
+npm run typecheck        # TypeScript 类型检查
+npm run lint             # ESLint
+npm run format:check     # Prettier 格式
+npm run check:public-info # 公开信息合规（凭据 / 本地路径 / 内部记录）
+npm test                 # 单元测试（公开示例题库）
+npm run test:ai          # AI 代理契约测试
+npm run build            # 生产构建
 ```
 
 浏览器 E2E（可选，需要 dev server）：
@@ -85,6 +86,18 @@ npm run test:browser
 - **不覆盖题库事实**：题目、选项、答案一旦入库不得改写，只能修正解析错误并在 CHANGELOG 说明。
 - **密钥只进服务端**：任何 API Key 不得出现在前端代码、构建产物或提交历史中。
 - **测试要真实**：不要把没跑过的测试写成 PASS；测试命令必须对应 `package.json` 中真实存在的脚本。
+- **公开信息最小披露**：内部研发过程、本地环境与协作方式不进入公开内容，见下方「公开信息治理」。
+
+## 公开信息治理
+
+公开交付遵循 [docs/information-governance.md](docs/information-governance.md)：
+
+- 公开内容只包含产品功能、技术实现、可复现的测试结果与正式维护记录。
+- 不得写入本地绝对路径、私人文件名、个人邮箱或内部工作过程。
+- 描述验证结果时写明命令、范围与提交，不使用无证据的验收表述。
+- 提交前运行 `npm run check:public-info`；该检查已纳入 CI，命中即失败。
+
+已知的历史暴露问题及处理决定记录在 [docs/history-exposure-report.md](docs/history-exposure-report.md)。
 
 ## 新增题库 schema 变更
 
