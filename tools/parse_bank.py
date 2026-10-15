@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Parse the extracted PDF text of 习思想题库汇总 into a validated JSON bank.
+Parse the extracted course question-bank text into a validated JSON bank.
 
 Input : tools/pdf_text.txt  (output of extract.py, page-delimited)
 Output: data/bank.json
+
+Usage:
+    py -X utf8 tools/parse_bank.py [--source "<label>"]
+
+`--source` sets the `source` label recorded in the output bank. It defaults to
+a neutral description so the private source document's name is never committed.
 
 Rules:
 - Preserve original stems, options, answers, chapters and in-chapter numbers.
@@ -15,6 +21,23 @@ import json, re, os, sys, hashlib
 
 TXT = os.path.join(os.path.dirname(__file__), "pdf_text.txt")
 OUT = os.path.join(os.path.dirname(__file__), "..", "data", "bank.json")
+
+# Neutral default: the private source document's filename is never committed.
+# Supply the real label at import time with `--source "<label>"`.
+DEFAULT_SOURCE_LABEL = "用户提供的课程题库（本地解析，未随仓库分发）"
+
+
+def resolve_source_label(argv):
+    """Return the `source` label, honouring `--source <label>` when supplied."""
+    for i, arg in enumerate(argv):
+        if arg == "--source" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--source="):
+            return arg.split("=", 1)[1]
+    return DEFAULT_SOURCE_LABEL
+
+
+SOURCE_LABEL = resolve_source_label(sys.argv[1:])
 
 CHAPTER_ORDER = [
     "导论", "第一章", "第二章", "第三章", "第四章", "第五章", "第六章", "第七章",
@@ -180,7 +203,7 @@ def main():
 
     bank = {
         "schema": "examPilot.bank.v1",
-        "source": "2026-2027-1：习思想题库汇总（20261010）.pdf",
+        "source": SOURCE_LABEL,
         "generatedAt": None,
         "chapterOrder": CHAPTER_ORDER,
         "countsByType": {},

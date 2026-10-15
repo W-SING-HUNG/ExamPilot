@@ -54,3 +54,7 @@
 
 - 全部学习数据存储在浏览器 IndexedDB，不上传任何服务器。
 - 导出文件由用户自行保管，请勿分享包含个人学习记录的备份。
+- 代码库的公开信息边界、提交前门禁与历史暴露处置见
+  [docs/information-governance.md](docs/information-governance.md) 与
+  [docs/history-exposure-report.md](docs/history-exposure-report.md)。
+- 提交前运行 `npm run check:public-info` 检查凭据、本地路径与内部记录（CI 已强制）。
