@@ -93,12 +93,17 @@
 ### 自动化检查
 
 ```bash
-npm run check:public-info
+npm run check:public-info               # 受版本控制的文件 + 当前分支的提交历史
+node tools/public-info-check.mjs --all-refs   # 维护者全量审计：扫描所有 ref
 ```
 
-该脚本扫描全部受版本控制的文件与提交信息，检查凭据特征、本地绝对路径、个人信息与内部记录。**自动化检查只能发现已知模式，不能替代人工审查。**
+该脚本扫描凭据特征、本地绝对路径、个人信息与内部研发记录。
 
-`npm run check:public-info` 已纳入 CI，任何一项命中都会使构建失败。
+- **默认范围**：文件取自已暂存内容（即本次提交将公开的内容），历史取当前分支的祖先提交。这样 PR 的 CI 不会因其他分支的无关内容失败。
+- **`--all-refs`**：扩大到所有分支与 Tag，供维护者做全仓库审计。
+- **`REVIEW` 级提示**不阻断构建，但必须人工确认；`SECRET` / `INTERNAL` 级命中直接失败。
+
+`npm run check:public-info` 已纳入 CI 的 `quality` Job。**自动化检查只能发现已知模式，不能替代人工审查。**
 
 ---
 

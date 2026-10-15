@@ -3,15 +3,22 @@
  * Public-information gate.
  *
  * Implements the automated portion of docs/information-governance.md:
- * scans every version-controlled file and the available commit history for
- * SECRET material, INTERNAL development records, and unverifiable claims.
+ * scans every version-controlled file and the commit history being delivered
+ * for SECRET material, INTERNAL development records, and unverifiable claims.
+ *
+ * Scope: files come from the index (what a commit would publish), and history
+ * comes from the current branch's ancestry (what this branch delivers). Scanning
+ * every ref with `--all` would report findings from unrelated branches and fail
+ * a PR's build for content it does not contain; use `--all-refs` for a
+ * maintainer-wide audit instead.
  *
  * This script can only detect known patterns. It does NOT replace human review,
  * and a clean run is not proof that the repository contains nothing sensitive.
  *
  * Usage:
- *   node tools/public-info-check.mjs            # scan tracked files + history
+ *   node tools/public-info-check.mjs              # files + this branch's history
  *   node tools/public-info-check.mjs --no-history
+ *   node tools/public-info-check.mjs --all-refs   # audit every ref (maintainer)
  *
  * Exit code 1 when an unallowlisted SECRET or INTERNAL finding is present.
  */
@@ -20,6 +27,7 @@ import { readFileSync } from 'node:fs'
 
 const args = new Set(process.argv.slice(2))
 const SCAN_HISTORY = !args.has('--no-history')
+const ALL_REFS = args.has('--all-refs')
 
 // ---------------------------------------------------------------------------
 // Flagged vocabulary.
@@ -200,12 +208,14 @@ for (const f of files) {
 // ---- scan commit history --------------------------------------------------
 let commitsScanned = 0
 if (SCAN_HISTORY) {
+  // Default: only the commits this branch actually delivers. `--all-refs`
+  // widens this to every ref for a maintainer-wide audit.
+  const logArgs = ALL_REFS
+    ? ['log', '--all', '--format=%H%x1f%s%x1f%b%x1e']
+    : ['log', 'HEAD', '--format=%H%x1f%s%x1f%b%x1e']
   let log = ''
   try {
-    log = execFileSync('git', ['log', '--all', '--format=%H%x1f%s%x1f%b%x1e'], {
-      encoding: 'utf8',
-      maxBuffer: 64 * 1024 * 1024,
-    })
+    log = execFileSync('git', logArgs, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
   } catch {
     log = ''
   }
