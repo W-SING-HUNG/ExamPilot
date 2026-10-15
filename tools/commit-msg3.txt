@@ -1,0 +1,12 @@
+ci: 修复 npm ci 依赖解析失败
+
+问题：CI 的 npm ci 报 ERESOLVE —— package-lock.json 与 package.json 不同步
+（新增 eslint/prettier/globals 等开发依赖后未重新生成锁定文件）。
+
+修复
+- 重新生成 package-lock.json，与 package.json 完全一致
+- 锁定 @types/react 与 @types/react-dom 为 18.x，避免 ^19 peer 冲突
+
+验证
+- npm ci --dry-run 通过
+- 本地 typecheck / lint / format:check / unit / build 全部通过
