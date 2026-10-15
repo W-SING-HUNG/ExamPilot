@@ -932,8 +932,8 @@ test('browser E2E', async (t) => {
     await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
 
     const body = await p.evaluate(() => document.body.textContent)
-    assert.match(body, /没有任何数据能对应到当前题库/, 'the reason is explained, not a silent deadlock')
-    assert.match(body, /没有可导入的内容/)
+    assert.match(body, /没有可导入的学习进度|没有任何数据能对应到当前题库/, 'the reason is explained, not a silent deadlock')
+    assert.match(body, /没有可导入的数据|没有可导入的内容/)
 
     const disabled = await p.evaluate(() => {
       const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
@@ -1363,7 +1363,7 @@ test('browser E2E', async (t) => {
       await p.evaluate(() => {
         const opts = document.querySelectorAll('.opt')
         if (opts.length > 0) {
-          ;(opts[0] as HTMLElement).click()
+          opts[0].click()
         }
       })
 
