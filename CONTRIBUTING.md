@@ -97,3 +97,47 @@ npm run test:browser
 ## 报告问题
 
 请使用 Issue 模板，附上复现步骤、期望行为与实际行为。涉及安全问题请见 [SECURITY.md](SECURITY.md)，不要公开提交细节。
+
+## 发布证据核验规则
+
+对外报告 CI 状态、Release 测试结果或「CI 已通过」之前，必须逐项核对以下内容。**不得把未核对或核对不符的运行报告为 PASS。**
+
+引用一条 Actions Run 作为主分支 CI 证据时，必须确认：
+
+| 核对项 | 要求 |
+| --- | --- |
+| workflow 名称 | 必须是 `CI`（即 `.github/workflows/ci.yml`） |
+| event | 必须是 `push`（PR 为 `pull_request`，二者含义不同，需说明） |
+| actor | 必须是仓库成员，**不能是 `dependabot[bot]`** |
+| head_sha | 必须与所声称的 commit SHA 一致 |
+| Job 结果 | 三个核心 Job 全部 `success`，逐一点名列出 |
+
+### 常见误报来源
+
+Dependabot 会在**同一个 commit** 上触发额外的运行，特征为：
+
+- workflow 名形如 `npm_and_yarn in / for <package> - Update #<id>`（或 `github_actions in / ...`）
+- `event: dynamic`
+- actor 为 `dependabot[bot]`
+- 只有 1 个名为 `Dependabot` 的 Job
+
+这类运行**不是**主分支 CI，即使结论是 `success` 也不能作为「main CI 通过」的证据。同理，PR 上的 CI 运行不能代表 main 分支状态。
+
+### 核对方式
+
+```bash
+# 列出 main 上的运行，注意 name / event / actor 三列
+gh api repos/W-SING-HUNG/ExamPilot/actions/runs?branch=main \
+  --jq '.workflow_runs[] | "\(.id)  \(.name)  event=\(.event)  actor=\(.actor.login)  \(.conclusion)"'
+
+# 查看单条运行的 Job 明细
+gh api repos/W-SING-HUNG/ExamPilot/actions/runs/<run_id>/jobs \
+  --jq '.jobs[] | "\(.name) -> \(.conclusion)"'
+```
+
+### 其他发布证据
+
+- Release 必须核对 `prerelease` 字段与 `target_commitish`
+- Tag 必须核对指向的 commit SHA（annotated tag 需再取一层 tag object）
+- 报告「已启用」的 GitHub 设置必须来自 API 实测响应；端点返回 404 或状态为 `disabled` 时，
+  必须如实报告「无法启用」并说明观察到的响应，**不得描述为已确认的原因或已启用**
