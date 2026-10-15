@@ -2,6 +2,33 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。当前处于 **Beta 阶段**：核心功能已实现并通过测试，但尚未经过大规模真实使用验证。
 
+## [Unreleased]
+
+### Added
+
+- 公开信息治理规范 `docs/information-governance.md`：信息分级（PUBLIC / INTERNAL / SECRET）、审查范围、推送前门禁与发布验收标准
+- 自动化门禁 `npm run check:public-info`（`tools/public-info-check.mjs`）：按模式扫描文件内容、单独扫描提交元数据，并对禁止提交的文件路径实施硬阻断；已纳入 CI
+- 门禁回归测试 `npm run test:public-info`（`tests/public-info-check.test.mjs`，53 项）：覆盖凭据不落日志、各扫描模式与元数据范围、路径硬阻断（含 `.env` 变体与私人文档名遮蔽）、锁文件扫描与 `git add -f` 绕过
+- 历史暴露记录 `docs/history-exposure-report.md`：风险性质、影响范围、修复状态与历史残留
+
+### Changed
+
+- `tools/extract.py`：移除硬编码的私人来源 PDF 文件名，改为命令行参数传入
+- `tools/parse_bank.py`：`source` 字段改为 `--source "<label>"` 参数，默认使用中性描述；解析逻辑与题库事实未改动
+- 门禁输出改为**只报告规则 ID、路径与说明，不输出匹配到的原文**，避免把检测到的凭据或私人信息再次写入 CI 日志
+- 门禁明确区分四种扫描模式（暂存内容 / 工作区 / 指定提交 / 全部 ref 的 Blob），输出中注明实际范围，不再把提交元数据扫描表述为历史内容审计
+- `--commit <rev>` 的元数据扫描按所选修订的祖先提交执行，不再固定读取 `HEAD`，并在输出中注明元数据范围
+- 新增禁止提交路径的硬阻断（`data/bank.json`、`data/local-bank.json`、`src/lib/local-bank.generated.ts`、`tools/pdf_text.txt`、`server/ai-config.json`、**全部 `.env` 及点号变体**、私人来源 PDF 等），不依赖 `.gitignore`
+- 私人来源文档等**文件名本身即私人信息**的路径统一遮蔽为「redacted path」，不再原样输出；固定通用路径照常显示以保持可操作性
+- 锁文件不再整体跳过：`package-lock.json` / `npm-shrinkwrap.json` 中的 `SECRET` 规则照常执行，仅跳过词汇类规则
+- `CONTRIBUTING.md`：新增「公开信息治理」章节与 Job 名称保护提示
+- PR 模板：新增公开信息合规检查项与门禁测试项
+- CI：`actions/checkout` 使用 `fetch-depth: 0`；`quality` Job 内新增公开信息检查与门禁测试**步骤**，**Job 名称保持不变**以兼容 `main` 的分支保护必需检查
+
+### Security
+
+- 已知残留：私人来源文档的文件名仍存在于历史提交与 `v0.1.0-beta` Tag 中，**未清除**，普通新提交无法清除；处理决定见 `docs/history-exposure-report.md`
+
 ## [0.1.0-beta] - 2026-10-15
 
 首个公开 Beta 版本。

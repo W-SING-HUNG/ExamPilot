@@ -102,6 +102,7 @@ React 18 · TypeScript · Vite · Dexie（IndexedDB）· Node 内置 http（AI �
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | 分层架构与数据流 |
 | [docs/study-strategy.md](docs/study-strategy.md) | 复习算法、学习科学依据、参数与限制 |
+| [docs/information-governance.md](docs/information-governance.md) | 公开信息分级、审查范围与推送前门禁 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 提交规范、开发流程、如何测试 |
 | [SECURITY.md](SECURITY.md) | 漏洞报告、密钥处理、AI 网关安全 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |
