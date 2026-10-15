@@ -40,8 +40,15 @@
 - AI 代理契约测试：6 项通过（含未配置 / 网关错误 / 非 JSON / 超时）
 - 浏览器 E2E：公开示例题库下 14 项通过
 - 以上结果在干净检出环境（无私人题库、无真实 API Key）复现
+- main CI（workflow `CI`，event `push`，head_sha `0974cd5`，3 个 Job 全部 success）：
+  <https://github.com/W-SING-HUNG/ExamPilot/actions/runs/38677155419>
 
-> 注：公开 CI 使用示例题库；1000 道本地完整题库的校验在本地单独执行，两者覆盖范围不同，未混为一谈。
+> 注 1：公开 CI 使用示例题库；1000 道本地完整题库的校验在本地单独执行，两者覆盖范围不同，未混为一谈。
+>
+> 注 2：Dependabot 会在同一 commit 上触发 `dynamic` event 的运行（workflow 名形如
+> `npm_and_yarn in / for <pkg> - Update #...`，actor 为 `dependabot[bot]`）。
+> 这类运行**不是**主分支 CI，引用发布证据时不得混用，核验规则见
+> [CONTRIBUTING.md](CONTRIBUTING.md#发布证据核验规则)。
 
 ## 发布流程
 
@@ -49,3 +56,4 @@
 2. `npm run typecheck && npm run lint && npm run format:check && npm test && npm run test:ai && npm run build`
 3. 打 tag：`git tag -a v0.1.0-beta -m "v0.1.0-beta"`
 4. 推送 tag 并在 GitHub 创建 Pre-release
+5. 按 [CONTRIBUTING.md 发布证据核验规则](CONTRIBUTING.md#发布证据核验规则) 核实 CI 证据后再对外报告
