@@ -4,14 +4,23 @@
 </p>
 
 <p align="center">
+  <a href="#"><img alt="version" src="https://img.shields.io/badge/version-0.1.0--beta-orange"></a>
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue"></a>
+  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20-brightgreen">
+</p>
+
+<p align="center">
   <em>Open-source study cockpit for the "Introduction to Xi Jinping Thought on Socialism with Chinese Characteristics for a New Era" final exam.</em>
 </p>
+
+> **状态：Beta (v0.1.0-beta)。** 核心功能已实现并通过自动化测试，但尚未经过大规模真实使用验证。请勿视为稳定正式版。
 
 ---
 
 ExamPilot 是一个开源、本地优先的期末复习应用：解析课程题库、按章节与题型组织训练、用间隔复习与错题再测提高覆盖率和正确率，并可选接入你自己的 LLM 网关做题目答疑与主观题参考评阅。
 
-**题库不随仓库分发。** 公开仓库只包含一份自行编写的示例题库（17 题），用于演示与 CI；完整课程题库由你本地提供（见[题库导入](#题库导入)）。
+
+**题库不随仓库分发。** 公开仓库只包含一份自行编写的示例题库（17 题，其中 3 题为教材标准表述，见[题库导入](#启用完整课程题库本地)），用于演示与 CI 测试；完整课程题库由你本地提供，仓库不包含、也未获授权再分发该题库。
 
 ## 特性
 
@@ -126,4 +135,13 @@ docs/           架构与复习策略文档
 
 ## License
 
-[MIT](LICENSE) — 详见仓库根目录 `LICENSE` 文件。
+本项目采用 [MIT License](LICENSE)。
+
+**Copyright (c) 2026 翁成航 (Chenghang Weng)**
+
+版权边界说明：
+
+- 上述版权声明仅覆盖本仓库中由项目作者自行编写的源代码、文档与配置
+- 仓库**不包含**任何课程题库内容；完整课程题库由用户自行本地提供，本项目未获授权也不主张其版权
+- 第三方依赖（React、TypeScript、Vite、Dexie 等）遵循其各自的开源许可，详见 `package.json`
+- 示例题库 `data/sample-bank.json` 由项目作者自行编写，随本项目以 MIT 许可分发
