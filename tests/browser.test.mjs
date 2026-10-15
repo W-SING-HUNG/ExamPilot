@@ -15,6 +15,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import puppeteer from 'puppeteer-core'
@@ -71,6 +72,25 @@ async function canImportSource(p) {
       return false
     }
   })
+}
+
+/**
+ * Puppeteer's uploadFile needs a real filesystem path, so a backup JSON produced
+ * inside the page is written to a temp file before being uploaded.
+ */
+function writeTempBackup(name, text) {
+  const dir = path.join(ROOT, 'tools', '.e2e-uploads')
+  mkdirSync(dir, { recursive: true })
+  const file = path.join(dir, name)
+  writeFileSync(file, text, 'utf8')
+  return file
+}
+
+/** Upload a JSON string through the page's real <input type=file>. */
+async function uploadBackup(p, name, text) {
+  const input = await p.$('input[type=file]')
+  assert.ok(input, 'file input exists')
+  await input.uploadFile(writeTempBackup(name, text))
 }
 
 test('browser E2E', async (t) => {
@@ -353,12 +373,15 @@ test('browser E2E', async (t) => {
     // verify the export payload builder via the real module
     const payload = await p.evaluate(async () => {
       const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
       const p2 = m.makeExportPayload({
-        settings: { theme: 'auto' },
+        settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
         records: [],
         history: [],
         mocks: [],
         aiReviews: [],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
       })
       return { schema: p2.schema, roundTrip: m.parseExport(m.serialize(p2)).ok }
     })
@@ -683,168 +706,373 @@ test('browser E2E', async (t) => {
     await ctx.close()
   })
 
-  await t.test('data import restores all collections (records + history + mocks + AI reviews)', async () => {
+  // ---- REAL BROWSER UI: import preview / confirm / restore ----------------
+
+  await t.test('UI: importing a file shows a preview and writes NOTHING until confirmed', async () => {
     const { p, ctx } = await freshPage()
-    // Produce some activity, then exercise the export/restore path via the real modules.
     await nav(p, 'io')
     await p.waitForSelector('.page-title')
-    const result = await p.evaluate(async () => {
-      const io = await import('/src/lib/io.ts')
-      const dbmod = await import('/src/db/database.ts')
-      const dbName = 'exampilot-e2e-' + Math.random().toString(36).slice(2, 8)
-      const testDb = dbmod.createDb(dbName)
-      const rec = {
-        qid: 'q1',
-        status: 'learning',
-        attempts: 2,
-        correctCount: 1,
-        wrongCount: 1,
-        lastSeenAt: 1,
-        lastCorrect: false,
-        lastAnswer: 'AC',
-        intervalDays: 3,
-        ease: 2,
-        nextReviewAt: 99,
-      }
-      const h = {
-        id: 'h1',
-        qid: 'q1',
-        mode: 'mock',
-        sessionId: 's',
-        answer: 'AC',
-        isCorrect: false,
-        submittedAt: 1,
-        usedAI: false,
-      }
-      const mock = {
-        id: 'm1',
-        startedAt: 1,
-        endedAt: 2,
-        config: {
-          singleCount: 1,
-          multiCount: 0,
-          judgeCount: 0,
-          shortCount: 0,
-          singleScore: 1,
-          multiScore: 2,
-          judgeScore: 1,
-          shortScore: 15,
-          durationMin: 5,
-          chapters: 'all',
-        },
-        submissions: { q1: 'AC' },
-        graded: true,
-        score: 0,
-        maxScore: 1,
-        objectiveMaxScore: 1,
-        subjectiveMaxScore: 0,
-        perQuestion: { q1: { isCorrect: false, points: 0, unanswered: false } },
-      }
-      const ai = {
-        id: 'a1',
-        qid: 'q1',
-        userAnswer: 'ans',
-        createdAt: 1,
-        provider: 'stub',
-        model: 'm',
-        result: {
-          score: 80,
-          maxScore: 100,
-          hitPoints: [],
-          missedPoints: [],
-          deductions: [],
-          suggestions: [],
-          structureNote: '',
-          disclaimer: '',
-        },
-      }
-      const settings = { theme: 'dark', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 }
-      await testDb.records.bulkPut([rec])
-      await testDb.history.bulkPut([h])
-      await testDb.mocks.bulkPut([mock])
-      await testDb.aiReviews.bulkPut([ai])
-      await testDb.settings.put({ ...settings, id: 'main' })
 
-      const before = await dbmod.snapshotDb(testDb)
-      const payload = io.makeExportPayload({
-        settings: before.settings,
-        records: before.records,
-        history: before.history,
-        mocks: before.mocks,
-        aiReviews: before.aiReviews,
-        bankFingerprint: 'fp',
-        bankCount: 1,
+    const seedAndBuild = await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      const payload = m.makeExportPayload({
+        settings: { theme: 'dark', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
+        records: [
+          {
+            qid: 'preview-only-q1',
+            status: 'learning',
+            attempts: 2,
+            correctCount: 2,
+            wrongCount: 0,
+            lastSeenAt: 1,
+            lastCorrect: true,
+            lastAnswer: 'A',
+            intervalDays: 1,
+            ease: 2,
+            nextReviewAt: 1,
+          },
+        ],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
       })
-      const parsed = io.parseExport(io.serialize(payload))
-      await testDb.records.clear()
-      await testDb.history.clear()
-      await testDb.mocks.clear()
-      await testDb.aiReviews.clear()
-      await testDb.settings.clear()
-      const plan = io.planImport(parsed.payload, 'replace')
-      const counts = await dbmod.restoreBackupInto(testDb, {
-        records: plan.records,
-        history: plan.history,
-        mocks: plan.mocks,
-        aiReviews: plan.aiReviews,
-        settings: parsed.payload.settings,
-      })
-      const after = await dbmod.snapshotDb(testDb)
-      await testDb.delete()
-      return {
-        ok: parsed.ok,
-        counts,
-        records: after.records.length,
-        history: after.history.length,
-        mocks: after.mocks.length,
-        aiReviews: after.aiReviews.length,
-        settings: after.settings,
-        wrongCount: after.records[0]?.wrongCount,
-        aiScore: after.aiReviews[0]?.result?.score,
-      }
+      globalThis.__backupText = m.serialize(payload)
+      return { ok: true }
     })
-    assert.equal(result.ok, true)
-    assert.equal(result.records, 1)
-    assert.equal(result.history, 1)
-    assert.equal(result.mocks, 1)
-    assert.equal(result.aiReviews, 1)
-    assert.equal(result.settings?.theme, 'dark', 'settings restored')
-    assert.equal(result.wrongCount, 1, 'record counters preserved')
-    assert.equal(result.aiScore, 80, 'AI review content preserved')
+    assert.equal(seedAndBuild.ok, true)
+
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'preview.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /导入预览/, 'preview is shown')
+    assert.match(body, /合并|替换/, 'strategy is shown')
+    assert.match(body, /学习记录/, 'diff table is shown')
+    assert.match(body, /确认导入/, 'a confirm button exists')
+    assert.match(body, /取消/, 'a cancel button exists')
+
+    // The database must still be EMPTY: the preview alone writes nothing.
+    const countBeforeConfirm = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      const snap = await dbmod.snapshotDb(dbmod.db)
+      return snap.records.length
+    })
+    assert.equal(countBeforeConfirm, 0, 'preview must not write to the database')
+
+    // Cancel and confirm nothing was written.
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '取消')
+      b?.click()
+    })
+    await new Promise((r) => setTimeout(r, 400))
+    const afterCancel = await p.evaluate(() => document.body.textContent)
+    assert.match(afterCancel, /已取消导入/)
+    const countAfterCancel = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      return (await dbmod.snapshotDb(dbmod.db)).records.length
+    })
+    assert.equal(countAfterCancel, 0, 'cancel leaves the database untouched')
     await ctx.close()
   })
 
-  await t.test('data import rejects malformed and mismatched backups without writing', async () => {
+  await t.test('UI: replace mode requires an explicit overwrite acknowledgement', async () => {
     const { p, ctx } = await freshPage()
-    const res = await p.evaluate(async () => {
-      const io = await import('/src/lib/io.ts')
-      const notJson = io.parseExport('nope')
-      const wrongSchema = io.parseExport(
-        JSON.stringify({ schema: 'x', records: [], history: [], mocks: [], aiReviews: [] }),
-      )
-      const missingArrays = io.parseExport(JSON.stringify({ schema: 'exampilot.export.v1', records: 'bad' }))
-      const dupes = io.parseExport(
-        JSON.stringify({
-          schema: 'exampilot.export.v1',
-          records: [{ qid: 'a' }, { qid: 'a' }],
-          history: [],
-          mocks: [],
-          aiReviews: [],
-        }),
-      )
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      const payload = m.makeExportPayload({
+        settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
+        records: [],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
+      })
+      globalThis.__backupText = m.serialize(payload)
+    })
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'replace.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.includes('替换（清空后写入）'))
+      b?.click()
+    })
+    await new Promise((r) => setTimeout(r, 400))
+
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /我确认要用备份替换/, 'an explicit overwrite checkbox is required')
+
+    const disabledBefore = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+      return b ? b.disabled : null
+    })
+    assert.equal(disabledBefore, true, 'confirm is blocked before the acknowledgement')
+
+    await p.evaluate(() => {
+      document.querySelectorAll('input[type=checkbox]')[0]?.click()
+    })
+    await new Promise((r) => setTimeout(r, 300))
+    const disabledAfter = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+      return b ? b.disabled : null
+    })
+    assert.equal(disabledAfter, false, 'confirm becomes available after acknowledgement')
+    await ctx.close()
+  })
+
+  await t.test('UI: fingerprint mismatch blocks restore until acknowledged', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const payload = m.makeExportPayload({
+        settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
+        records: [],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: 'a-completely-different-bank-fingerprint',
+        bankCount: 17,
+      })
+      globalThis.__backupText = m.serialize(payload)
+    })
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'mismatch.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /题库不一致/, 'mismatch is surfaced')
+    assert.match(body, /系统不会自动执行恢复/, 'auto-restore is explicitly refused')
+
+    const disabled = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+      return b ? b.disabled : null
+    })
+    assert.equal(disabled, true, 'confirm is blocked on a fingerprint mismatch')
+    await ctx.close()
+  })
+
+  await t.test('UI: a legacy backup without a fingerprint warns and needs acknowledgement', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const payload = m.makeExportPayload({
+        settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
+        records: [],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: '',
+        bankCount: 0,
+      })
+      globalThis.__backupText = m.serialize(payload)
+    })
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'legacy.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /旧版备份/, 'legacy backup is identified')
+    assert.match(body, /无法确认题目是否一致/, 'risk is stated')
+    assert.match(body, /我确认这是旧版备份/, 'an explicit acknowledgement is required')
+
+    const disabled = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+      return b ? b.disabled : null
+    })
+    assert.equal(disabled, true, 'legacy restore is blocked until acknowledged')
+    await ctx.close()
+  })
+
+  await t.test('UI: confirmed import restores all five collections into the real database', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+
+    const prepared = await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      // use a real question id so the rows match the running bank
+      const realId = bankMod.allQuestions[0].id
+      const payload = m.makeExportPayload({
+        settings: { theme: 'dark', reviewIntervalBase: 2, studyTarget: 45, dailyGoalQuestions: 25 },
+        records: [
+          {
+            qid: realId,
+            status: 'learning',
+            attempts: 3,
+            correctCount: 2,
+            wrongCount: 1,
+            lastSeenAt: 11,
+            lastCorrect: false,
+            lastAnswer: 'AC',
+            intervalDays: 3,
+            ease: 2,
+            nextReviewAt: 99,
+          },
+        ],
+        history: [
+          {
+            id: 'imported-h1',
+            qid: realId,
+            mode: 'mock',
+            sessionId: 's',
+            answer: 'AC',
+            isCorrect: false,
+            submittedAt: 11,
+            usedAI: false,
+          },
+        ],
+        mocks: [
+          {
+            id: 'imported-m1',
+            startedAt: 1,
+            endedAt: 2,
+            config: {
+              singleCount: 1,
+              multiCount: 0,
+              judgeCount: 0,
+              shortCount: 0,
+              singleScore: 1,
+              multiScore: 2,
+              judgeScore: 1,
+              shortScore: 15,
+              durationMin: 5,
+              chapters: 'all',
+            },
+            submissions: { [realId]: 'AC' },
+            graded: true,
+            score: 0,
+            maxScore: 1,
+            objectiveMaxScore: 1,
+            subjectiveMaxScore: 0,
+            perQuestion: { [realId]: { isCorrect: false, points: 0, unanswered: false } },
+          },
+        ],
+        aiReviews: [
+          {
+            id: 'imported-a1',
+            qid: realId,
+            userAnswer: 'ans',
+            createdAt: 1,
+            provider: 'stub',
+            model: 'm',
+            result: {
+              score: 80,
+              maxScore: 100,
+              hitPoints: [],
+              missedPoints: [],
+              deductions: [],
+              suggestions: [],
+              structureNote: '',
+              disclaimer: '',
+            },
+          },
+        ],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
+      })
+      globalThis.__backupText = m.serialize(payload)
+      globalThis.__realId = realId
+      return { fingerprint: payload.bankFingerprint.slice(0, 12), realId }
+    })
+    assert.ok(prepared.fingerprint)
+
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'good.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    const previewBody = await p.evaluate(() => document.body.textContent)
+    assert.match(previewBody, /题库一致/, 'matching fingerprint needs no acknowledgement')
+
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+      b?.click()
+    })
+    await p.waitForFunction(() => document.body.textContent.includes('导入完成'), { timeout: 15000 })
+
+    // Verify the REAL app database contains all five collections after confirm.
+    const stored = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      const snap = await dbmod.snapshotDb(dbmod.db)
+      const realId = globalThis.__realId
       return {
-        notJson: notJson.ok,
-        wrongSchema: wrongSchema.ok,
-        wrongSchemaMsg: wrongSchema.errors[0],
-        missingArrays: missingArrays.ok,
-        dupes: dupes.ok,
+        records: snap.records.length,
+        history: snap.history.length,
+        mocks: snap.mocks.length,
+        aiReviews: snap.aiReviews.length,
+        settings: snap.settings,
+        wrongCount: snap.records.find((r) => r.qid === realId)?.wrongCount,
+        aiScore: snap.aiReviews[0]?.result?.score,
+        mockScore: snap.mocks[0]?.score,
       }
     })
-    assert.equal(res.notJson, false)
-    assert.equal(res.wrongSchema, false)
-    assert.match(res.wrongSchemaMsg, /不支持的备份格式/)
-    assert.equal(res.missingArrays, false)
-    assert.equal(res.dupes, false)
+    assert.equal(stored.records, 1, 'records restored')
+    assert.equal(stored.history, 1, 'history restored')
+    assert.equal(stored.mocks, 1, 'mock archive restored')
+    assert.equal(stored.aiReviews, 1, 'AI reviews restored')
+    assert.equal(stored.settings?.theme, 'dark', 'settings restored')
+    assert.equal(stored.settings?.studyTarget, 45, 'settings values restored')
+    assert.equal(stored.wrongCount, 1, 'record counters preserved')
+    assert.equal(stored.aiScore, 80, 'AI review content preserved')
+    assert.equal(stored.mockScore, 0, 'mock score preserved')
+    await ctx.close()
+  })
+
+  await t.test('UI: re-submitting the same mock exam does not double-count (real DB)', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'mock')
+    await p.waitForSelector('.card-title')
+    await new Promise((r) => setTimeout(r, 300))
+
+    const out = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      const session = await import('/src/lib/session.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      const paper = bankMod.allQuestions.filter((q) => q.type === 'single').slice(0, 3)
+      const submissions = Object.fromEntries(paper.map((q) => [q.id, 'A']))
+      const config = {
+        singleCount: 3,
+        multiCount: 0,
+        judgeCount: 0,
+        shortCount: 0,
+        singleScore: 1,
+        multiScore: 2,
+        judgeScore: 1,
+        shortScore: 15,
+        durationMin: 5,
+        chapters: 'all',
+      }
+      const input = { runId: 'ui-race-run', paper, submissions, config, startedAt: 1, endedAt: 2 }
+      const first = await session.submitMockRun(dbmod.db, input)
+      const second = await session.submitMockRun(dbmod.db, input)
+      const snap = await dbmod.snapshotDb(dbmod.db)
+      return {
+        first: first.status,
+        second: second.status,
+        secondWritten: second.written.records + second.written.history,
+        historyForFirst: snap.history.filter((h) => h.qid === paper[0].id).length,
+        attempts: snap.records.find((r) => r.qid === paper[0].id)?.attempts,
+        mocks: snap.mocks.filter((m) => m.id === 'ui-race-run').length,
+      }
+    })
+    assert.equal(out.first, 'committed')
+    assert.equal(out.second, 'already-submitted', 'a replay must be a no-op')
+    assert.equal(out.secondWritten, 0, 'a replay writes nothing')
+    assert.equal(out.historyForFirst, 1, 'exactly one history row per question')
+    assert.equal(out.attempts, 1, 'attempts are not double-counted')
+    assert.equal(out.mocks, 1, 'exactly one mock archive row')
     await ctx.close()
   })
 })

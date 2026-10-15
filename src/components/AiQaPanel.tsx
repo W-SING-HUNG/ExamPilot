@@ -62,7 +62,7 @@ export function AiGradePanel({
   userAnswer: string
   sessionId?: string
 }) {
-  const { saveAiReview, saveSubjectiveAttempt } = useStore()
+  const { saveAiReviewForQuestion } = useStore()
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<null | {
     score: number
@@ -92,18 +92,12 @@ export function AiGradePanel({
       })
       if (r.ok && r.result) {
         setResult(r.result)
-        // Persist the original answer plus the review (provider, model, time, result).
+        // Saved in ONE transaction: the review row is keyed by (sessionId, qid),
+        // and the training attempt is only created if this question has not
+        // already been attempted in this session. Repeated reviews therefore
+        // never inflate the attempt count.
         try {
-          await saveSubjectiveAttempt(q, userAnswer, 'ai-review', sessionId, true)
-          await saveAiReview({
-            id: `ai-${Date.now()}-${q.id}-${Math.random().toString(36).slice(2, 7)}`,
-            qid: q.id,
-            userAnswer,
-            createdAt: Date.now(),
-            provider: r.provider ?? 'sub2api',
-            model: r.model ?? '',
-            result: r.result,
-          })
+          await saveAiReviewForQuestion(q, userAnswer, sessionId, r.provider ?? 'sub2api', r.model ?? '', r.result)
           setSaved(true)
         } catch (e) {
           setReason(`评阅结果已生成，但保存失败：${(e as Error).message}`)

@@ -64,6 +64,9 @@ export interface RestoreInput {
  * All-or-nothing: if any write throws, Dexie aborts the transaction and every
  * table keeps its previous content, so a failed import cannot leave a
  * half-restored database. Returns the number of rows written per table.
+ *
+ * The settings table is ALWAYS cleared first, so a "replace" restore never
+ * silently keeps stale settings while reporting success.
  */
 export async function restoreBackupInto(
   target: ExamPilotDB,
@@ -82,6 +85,7 @@ export async function restoreBackupInto(
       await target.history.clear()
       await target.mocks.clear()
       await target.aiReviews.clear()
+      await target.settings.clear()
       if (input.records.length) {
         await target.records.bulkPut(input.records)
         counts.records = input.records.length

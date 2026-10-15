@@ -1,8 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { db, restoreBackupInto } from '../db/database'
-import type { QRecord, HistoryEntry, MockRun, AiReview, AppSettings } from '../lib/types'
+import type { QRecord, HistoryEntry, MockRun, AiReview, AppSettings, AiGradeResult, MockConfig } from '../lib/types'
 import { freshRecord, applyAttempt } from '../lib/scheduler'
 import { scoreAnswer, isAnswerBlank } from '../lib/scoring'
+import { submitMockRun as submitMockRunTx, saveAiReviewWithAttempt } from '../lib/session'
 import type { Question } from '../lib/types'
 
 export interface SubmitOutcome {
@@ -39,6 +40,27 @@ interface StoreValue {
   ) => Promise<void>
   getRecord: (qid: string) => QRecord | undefined
   saveAiReview: (r: AiReview) => Promise<void>
+  /** Save an AI review and at most one training attempt for this session. */
+  saveAiReviewForQuestion: (
+    q: Question,
+    userAnswer: string,
+    sessionId: string,
+    provider: string,
+    model: string,
+    result: AiGradeResult,
+  ) => Promise<{ created: boolean }>
+  /**
+   * Persist a whole mock-exam submission transactionally and idempotently.
+   * Re-submitting the same runId never double-counts learning data.
+   */
+  submitMockRun: (input: {
+    runId: string
+    paper: Question[]
+    submissions: Record<string, string | null>
+    config: MockConfig
+    startedAt: number
+    endedAt: number
+  }) => Promise<{ status: 'committed' | 'already-submitted'; run: MockRun }>
   saveMockRun: (m: MockRun) => Promise<void>
   deleteMockRun: (id: string) => Promise<void>
   updateSettings: (s: Partial<AppSettings>) => Promise<void>
@@ -124,22 +146,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         submittedAt: now,
         usedAI,
       }
-      const rec = records.get(q.id) ?? freshRecord(q.id, now)
-      const next: QRecord = applyAttempt(
-        { ...rec, ease: Math.max(rec.ease, settings.reviewIntervalBase) },
-        isCorrect === true,
-        now,
-      )
-      next.lastAnswer = answer ?? null
-      next.lastCorrect = isCorrect
       await db.transaction('rw', db.records, db.history, async () => {
-        await db.records.put(next)
+        // Read the authoritative row INSIDE the transaction: the React snapshot
+        // may be stale (concurrent tab, or a write not yet refreshed).
+        const current = (await db.records.get(q.id)) ?? freshRecord(q.id, now)
+        const merged: QRecord = applyAttempt(
+          { ...current, ease: Math.max(current.ease, settings.reviewIntervalBase) },
+          isCorrect === true,
+          now,
+        )
+        merged.lastAnswer = answer ?? null
+        merged.lastCorrect = isCorrect
+        await db.records.put(merged)
         await db.history.add(entry)
       })
       await refresh()
       return { isCorrect, blank }
     },
-    [records, refresh, settings.reviewIntervalBase],
+    [refresh, settings.reviewIntervalBase],
   )
 
   const saveSubjectiveAttempt = useCallback<StoreValue['saveSubjectiveAttempt']>(
@@ -155,12 +179,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         submittedAt: now,
         usedAI,
       }
-      const rec = records.get(q.id) ?? freshRecord(q.id, now)
       // subjective attempts count as "attempted" but never auto-correct
       await db.transaction('rw', db.records, db.history, async () => {
+        const current = (await db.records.get(q.id)) ?? freshRecord(q.id, now)
         await db.records.put({
-          ...rec,
-          attempts: rec.attempts + 1,
+          ...current,
+          attempts: current.attempts + 1,
           lastSeenAt: now,
           lastCorrect: null,
           lastAnswer: answer,
@@ -170,7 +194,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       })
       await refresh()
     },
-    [records, refresh],
+    [refresh],
   )
 
   const value = useMemo<StoreValue>(
@@ -187,6 +211,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       saveAiReview: async (r: AiReview) => {
         await db.aiReviews.put(r)
         await refresh()
+      },
+      saveAiReviewForQuestion: async (q, userAnswer, sessionId, provider, model, result) => {
+        const out = await saveAiReviewWithAttempt(db, {
+          sessionId,
+          qid: q.id,
+          question: q,
+          userAnswer,
+          provider,
+          model,
+          result,
+        })
+        await refresh()
+        return out
+      },
+      submitMockRun: async (input) => {
+        const out = await submitMockRunTx(db, input)
+        await refresh()
+        return { status: out.status, run: out.run }
       },
       saveMockRun: async (m: MockRun) => {
         await db.mocks.put(m)

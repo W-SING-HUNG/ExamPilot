@@ -8,6 +8,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -16,11 +18,25 @@ const ROOT = path.resolve(__dirname, '..')
 const PROXY_PORT = 8791
 const BASE = `http://127.0.0.1:${PROXY_PORT}`
 
+// Every proxy spawned by this suite writes to its OWN config file, so a test
+// can never pollute the developer's real server/ai-config.json.
+const TMP_DIR = mkdtempSync(path.join(tmpdir(), 'exampilot-ai-test-'))
+const CONFIG_PATH = path.join(TMP_DIR, 'ai-config.json')
+
 let proxy
 
 async function startProxy(env = {}) {
   proxy = spawn(process.execPath, [path.join(ROOT, 'server', 'index.mjs')], {
-    env: { ...process.env, AI_PORT: String(PROXY_PORT), AI_BASE_URL: '', AI_API_KEY: '', AI_MODEL: '', ...env },
+    env: {
+      ...process.env,
+      AI_PORT: String(PROXY_PORT),
+      AI_CONFIG_PATH: CONFIG_PATH,
+      AI_BASE_URL: '',
+      AI_API_KEY: '',
+      AI_MODEL: '',
+      AI_CONFIG_TOKEN: '',
+      ...env,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let log = ''
@@ -43,6 +59,47 @@ async function startProxy(env = {}) {
 }
 
 const stopProxy = () => proxy && proxy.kill('SIGTERM')
+
+process.on('exit', () => {
+  try {
+    rmSync(TMP_DIR, { recursive: true, force: true })
+  } catch {
+    /* ignore */
+  }
+})
+
+/**
+ * Spawn the proxy and capture its exit code + output, without waiting for it to
+ * serve. Used to assert that unsafe configurations are REFUSED at startup.
+ */
+function spawnProxyExpectingExit(env = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [path.join(ROOT, 'server', 'index.mjs')], {
+      env: {
+        ...process.env,
+        AI_PORT: String(PROXY_PORT + 50),
+        AI_CONFIG_PATH: CONFIG_PATH,
+        ...env,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let out = ''
+    child.stdout.on('data', (d) => {
+      out += d
+    })
+    child.stderr.on('data', (d) => {
+      out += d
+    })
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      resolve({ code: null, out: out + '\n[timeout: still running]' })
+    }, 6000)
+    child.on('exit', (code) => {
+      clearTimeout(timer)
+      resolve({ code, out })
+    })
+  })
+}
 
 /** Start a stub gateway with a scripted response. */
 async function startStub(port, script) {
@@ -390,4 +447,58 @@ test('AI proxy: valid grade still succeeds with all fields', async (t) => {
   assert.equal(body.ok, true)
   assert.equal(body.result.score, 82)
   assert.equal(body.result.maxScore, 100)
+})
+
+// ---- listen-address hardening -------------------------------------------
+
+test('AI proxy: REFUSES to bind a non-loopback host without AI_ALLOW_REMOTE', async () => {
+  const { code, out } = await spawnProxyExpectingExit({
+    AI_HOST: '0.0.0.0',
+    AI_BASE_URL: '',
+    AI_API_KEY: '',
+    AI_MODEL: '',
+  })
+  assert.equal(code, 1, 'must exit non-zero instead of exposing the proxy')
+  assert.match(out, /拒绝启动/)
+  assert.match(out, /AI_ALLOW_REMOTE/)
+})
+
+test('AI proxy: REFUSES remote mode without a config token', async () => {
+  const { code, out } = await spawnProxyExpectingExit({
+    AI_HOST: '0.0.0.0',
+    AI_ALLOW_REMOTE: '1',
+    AI_CONFIG_TOKEN: '',
+  })
+  assert.equal(code, 1, 'remote mode without a token must be refused')
+  assert.match(out, /AI_CONFIG_TOKEN/)
+})
+
+test('AI proxy: loopback host still starts normally', async (t) => {
+  const log = await startProxy({ AI_HOST: '127.0.0.1' })
+  t.after(stopProxy)
+  assert.match(log, /listening on http:\/\/127\.0\.0\.1/)
+  const r = await fetch(`${BASE}/api/ai/status`)
+  assert.equal(r.status, 200)
+})
+
+test('AI proxy: config write requires the shared token when remote mode is on', async (t) => {
+  // Bind loopback but enable the token requirement: without the token the write
+  // must be refused, and with it the write succeeds.
+  await startProxy({ AI_HOST: '127.0.0.1', AI_CONFIG_TOKEN: 'shared-secret' })
+  t.after(stopProxy)
+
+  const denied = await fetch(`${BASE}/api/ai/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ baseUrl: 'http://x/v1', apiKey: 'k', model: 'm' }),
+  })
+  assert.equal(denied.status, 403, 'missing token must be refused')
+
+  const allowed = await fetch(`${BASE}/api/ai/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-exampilot-config-token': 'shared-secret' },
+    body: JSON.stringify({ baseUrl: 'http://x/v1', apiKey: 'k', model: 'm' }),
+  })
+  assert.equal(allowed.status, 200)
+  assert.equal((await allowed.json()).ok, true)
 })

@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store/StoreContext'
 import { allQuestions, chapterOrder, TYPE_LABEL } from '../lib/bank'
 import { buildPaper } from '../lib/scheduler'
-import { gradeMockSubmission } from '../lib/mock-grading'
 import { CardPad, PageHead, Tag, Empty, Bar, useToast } from '../components/ui'
 import { QuestionCard } from '../components/QuestionCard'
 import { AiGradePanel } from '../components/AiQaPanel'
@@ -30,7 +29,7 @@ export function MockExam({
   nav: (r: RouteName, p?: Record<string, string>) => void
   params: Record<string, string>
 }) {
-  const { ready, saveMockRun, submitAnswer, saveSubjectiveAttempt } = useStore()
+  const { ready, submitMockRun } = useStore()
   const [config, setConfig] = useState<MockConfig>(DEFAULT_CONFIG)
   const [phase, setPhase] = useState<Phase>('config')
   const [paper, setPaper] = useState<Question[]>([])
@@ -80,52 +79,36 @@ export function MockExam({
   }
 
   /**
-   * Grade and persist into the SAME shared records/history (single progress system).
+   * Submit the exam.
    *
-   * Grading rules live in `gradeMockSubmission` (unit-tested):
-   *  - Blank objective answers are `unanswered`, never wrong, and are NOT
-   *    written to learning records or the wrong-question bank.
-   *  - Subjective points are reported separately from auto-graded points.
-   *  - Re-submitting the same run is guarded by `submitting`, so learning data
-   *    cannot be double-counted.
+   * The whole submission (learning records + history + mock archive) is applied
+   * by `submitMockRun` inside ONE Dexie transaction, keyed by the stable `runId`:
+   *  - a failure anywhere rolls everything back (no half-persisted exam);
+   *  - re-entry after success is a no-op, so double-clicking 交卷 or a timer/manual
+   *    race cannot double-count attempts, correct counts or the wrong bank;
+   *  - progress is read from the DB inside the transaction, not from this
+   *    component's possibly stale snapshot.
    */
   const submitAll = async (auto = false) => {
     if (submitting.current) return
     if (paper.length === 0) return
     submitting.current = true
     try {
-      const graded = gradeMockSubmission(paper, answers, config)
-      const sessionKey = runId
-
-      // Persist only what is a genuine attempt: answered objective questions,
-      // plus answered subjective questions as training attempts.
-      for (const { q, answer } of graded.persisted) {
-        await submitAnswer(q, answer, 'mock', sessionKey, false, { skipPersistence: false })
-      }
-      for (const { q, answer } of graded.subjective) {
-        await saveSubjectiveAttempt(q, answer, 'mock', sessionKey, false)
-      }
-
-      const run: MockRun = {
-        id: runId,
+      const out = await submitMockRun({
+        runId,
+        paper,
+        submissions: answers,
+        config,
         startedAt: endsAt - config.durationMin * 60000,
         endedAt: Date.now(),
-        config,
-        submissions: answers,
-        graded: true,
-        score: graded.score,
-        maxScore: graded.maxScore,
-        objectiveMaxScore: graded.objectiveMaxScore,
-        subjectiveMaxScore: graded.subjectiveMaxScore,
-        perQuestion: graded.perQuestion,
-      }
-      await saveMockRun(run)
-      setResult(run)
+      })
+      setResult(out.run)
       setPhase('done')
       if (auto) toast('考试时间到，已自动交卷')
+      else if (out.status === 'already-submitted') toast('本场考试已提交，未重复计分')
     } catch (e) {
-      // Persistence failed: keep the exam on screen so the user can retry.
-      toast(`交卷失败：${(e as Error).message}。请重试，已保存的学习数据不会被重复累计。`)
+      // Transaction rolled back: the exam stays on screen and can be retried.
+      toast(`交卷失败：${(e as Error).message}。数据未写入，可安全重试。`)
     } finally {
       submitting.current = false
     }
@@ -150,6 +133,13 @@ export function MockExam({
         title="全真模拟考试"
         desc="题型、题量、分值与时长均可配置——未获知正式考试要求时，默认值只是模板，不代表真实考纲。成绩与练习共用同一套学习记录。"
       />
+
+      <CardPad style={{ marginBottom: 14 }}>
+        <div className="muted-2">
+          限制说明：考试进行中若刷新页面或关闭标签页，本场考试的作答现场<b>不会保留</b>，需重新开始。
+          交卷写入具有事务性与幂等性：失败会整体回滚，同一场考试重复提交不会重复累计学习数据。
+        </div>
+      </CardPad>
 
       {phase === 'config' && (
         <>
@@ -448,7 +438,9 @@ export function MockExam({
                         >
                           {aiQid === qq.id ? '收起 AI 评阅' : 'AI 参考评阅'}
                         </button>
-                        {aiQid === qq.id && <AiGradePanel q={qq} userAnswer={mine ?? ''} />}
+                        {aiQid === qq.id && (
+                          <AiGradePanel q={qq} userAnswer={mine ?? ''} sessionId={`mock-${result.id}`} />
+                        )}
                       </>
                     )}
                   </div>

@@ -12,18 +12,53 @@
  * Never fabricates AI availability: when unconfigured it returns ok:false.
  *
  * Security boundary:
- *   - Binds to 127.0.0.1 only (never 0.0.0.0), so the gateway key is not reachable
- *     from other machines on the network.
+ *   - Binds to loopback only. A non-loopback AI_HOST is REFUSED at startup
+ *     unless AI_ALLOW_REMOTE=1 is explicitly set, because the config endpoint
+ *     has no user authentication and would otherwise be reachable from the LAN.
+ *   - Even with AI_ALLOW_REMOTE=1, config writes additionally require
+ *     AI_CONFIG_TOKEN (header `x-exampilot-config-token`), so the endpoint is
+ *     never remotely writable without a shared secret.
  *   - CORS allows only the local dev/preview origins, not `*`.
  *   - The API key is never returned to the browser and never logged.
- *   - /api/ai/config requires an allowed local Origin (or no Origin at all, i.e.
- *     a direct local request such as curl); remote web pages cannot rewrite config.
+ *   - /api/ai/config requires a loopback peer plus a trusted local Origin.
  */
 import http from 'node:http'
 import { loadAiConfig, saveAiConfig, isConfigured } from './config.mjs'
 
 const PORT = Number(process.env.AI_PORT || 8787)
-const HOST = process.env.AI_HOST || '127.0.0.1'
+const REQUESTED_HOST = process.env.AI_HOST || '127.0.0.1'
+const ALLOW_REMOTE = process.env.AI_ALLOW_REMOTE === '1'
+const CONFIG_TOKEN = process.env.AI_CONFIG_TOKEN || ''
+
+/** True for loopback addresses (IPv4/IPv6, including IPv4-mapped forms). */
+function isLoopbackAddress(addr) {
+  if (!addr) return false
+  const a = String(addr).replace(/^::ffff:/i, '')
+  return a === '127.0.0.1' || a === '::1' || a === 'localhost' || a.startsWith('127.')
+}
+
+function isLoopbackHost(host) {
+  return isLoopbackAddress(host)
+}
+
+// Refuse to expose the unauthenticated proxy on a network interface by accident.
+if (!isLoopbackHost(REQUESTED_HOST) && !ALLOW_REMOTE) {
+  console.error(
+    `[ExamPilot AI proxy] 拒绝启动：AI_HOST=${REQUESTED_HOST} 不是回环地址。\n` +
+      '  该代理没有用户身份认证，绑定到非回环地址会把 AI 配置接口暴露到网络。\n' +
+      '  如确需远程访问，请显式设置 AI_ALLOW_REMOTE=1，并设置 AI_CONFIG_TOKEN 作为配置写入的共享密钥。',
+  )
+  process.exit(1)
+}
+if (!isLoopbackHost(REQUESTED_HOST) && ALLOW_REMOTE && !CONFIG_TOKEN) {
+  console.error(
+    '[ExamPilot AI proxy] 拒绝启动：AI_ALLOW_REMOTE=1 时必须同时设置 AI_CONFIG_TOKEN，' +
+      '否则配置接口将在无认证的情况下可被远程写入。',
+  )
+  process.exit(1)
+}
+
+const HOST = REQUESTED_HOST
 const cfg = await loadAiConfig()
 
 // Origins permitted to call this proxy. Vite dev/preview ports only.
@@ -61,6 +96,19 @@ function applyCors(req, res) {
     res.setHeader('Access-Control-Allow-Origin', origin)
     res.setHeader('Vary', 'Origin')
   }
+}
+
+/**
+ * Config writes are allowed only for a loopback TCP peer with a trusted origin —
+ * plus, when a shared token is configured, a matching token. This holds even if
+ * the operator deliberately bound to a network interface.
+ */
+function mayWriteConfig(req) {
+  const peer = req.socket?.remoteAddress
+  if (CONFIG_TOKEN) {
+    return req.headers['x-exampilot-config-token'] === CONFIG_TOKEN
+  }
+  return isLoopbackAddress(peer) && isTrustedOrigin(req)
 }
 
 function readBody(req) {
@@ -275,10 +323,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && url.pathname === '/api/ai/config') {
-    // Config writes are restricted to trusted local origins: a remote web page
-    // must not be able to repoint this proxy at an attacker-controlled gateway.
-    if (!isTrustedOrigin(req)) {
-      return send(res, 403, { ok: false, message: '仅允许本地开发来源修改 AI 配置' })
+    // Config writes require a loopback peer with a trusted origin, or the
+    // configured shared token when one was set.
+    if (!mayWriteConfig(req)) {
+      return send(res, 403, {
+        ok: false,
+        message: '配置写入仅允许来自本机的受信任来源（配置了共享密钥时需提供 x-exampilot-config-token）',
+      })
     }
     try {
       const body = JSON.parse((await readBody(req)) || '{}')
@@ -337,6 +388,12 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`[ExamPilot AI proxy] listening on http://${HOST}:${PORT}`)
   console.log(`[ExamPilot AI proxy] configured=${isConfigured(cfg)} model=${cfg.model || '(unset)'}`)
+  if (!isLoopbackHost(HOST)) {
+    console.warn(
+      `[ExamPilot AI proxy] 警告：已绑定非回环地址 ${HOST}（AI_ALLOW_REMOTE=1）。` +
+        '配置写入需要 AI_CONFIG_TOKEN。请确保仅在可信网络中运行。',
+    )
+  }
   if (!isConfigured(cfg)) {
     console.log('[ExamPilot AI proxy] 提示：AI 网关未配置；刷题、评分与本地记录不受影响。')
   }
