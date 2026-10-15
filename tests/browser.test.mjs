@@ -510,16 +510,12 @@ test('browser E2E', async (t) => {
     await new Promise((r) => setTimeout(r, 400))
     const theme = await p.evaluate(() => document.documentElement.dataset.theme)
     if (theme !== 'dark') {
-      console.log('THEME DEBUG: dataset.theme =', theme)
-      console.log(
-        '  buttons found:',
-        await p.evaluate(() =>
-          Array.from(document.querySelectorAll('.btn.btn-sm'))
-            .map((b) => b.textContent)
-            .join(','),
-        ),
+      const btns = await p.evaluate(() =>
+        Array.from(document.querySelectorAll('.btn.btn-sm'))
+          .map((b) => b.textContent)
+          .join(','),
       )
-      console.log('  page errors:', errors.slice(0, 3))
+      console.log('THEME DEBUG: dataset.theme =', theme, '| buttons:', btns)
     }
     assert.equal(theme, 'dark')
     const bg = await p.evaluate(() => getComputedStyle(document.body).backgroundColor)
