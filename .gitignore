@@ -59,3 +59,5 @@ scratch/
 # ---- transient CI/API artifacts ----
 tools/*.json
 tools/ci-job-*.log
+
+tools/list-jobs.mjs

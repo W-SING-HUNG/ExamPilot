@@ -1,0 +1,6 @@
+chore: 忽略临时辅助脚本并整理工作区
+
+- tools/list-jobs.mjs 为一次性 CI 诊断脚本，加入 .gitignore
+- 清理本地 CI/API 临时产物（*.json 转储、日志）
+
+无功能变更。
