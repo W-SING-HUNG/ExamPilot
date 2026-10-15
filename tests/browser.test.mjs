@@ -1567,27 +1567,45 @@ test('browser E2E', async (t) => {
 
       let submittedCount = 0
       let subjectiveTested = false
+      let answeredSubjBaselineAttempts = 0
 
       // Loop through questions until we answer at least 2 questions and definitely answer a subjective question with AI review
       for (let step = 0; step < 12; step++) {
         await p.waitForSelector('.q-stem', { timeout: 10000 })
-        const isSubj = await p.evaluate(() => {
+        const questionInfo = await p.evaluate(async () => {
           const ta = document.querySelector('textarea')
           if (ta) {
             const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
             setter?.call(ta, '主观题测试详细回答内容')
             ta.dispatchEvent(new Event('input', { bubbles: true }))
-            return true
+
+            // Read currently displayed question id and its baseline attempts from IndexedDB
+            const dbmod = await import('/src/db/database.ts')
+            const bankMod = await import('/src/lib/bank.ts')
+            const stemText = document.querySelector('.q-stem')?.textContent?.trim() || ''
+            const matchedQ = bankMod.allQuestions.find(
+              (q) => q.stem.trim() === stemText || stemText.includes(q.stem.trim().slice(0, 30)),
+            )
+            let baseline = 0
+            if (matchedQ) {
+              const rec = await dbmod.db.records.get(matchedQ.id)
+              baseline = rec?.attempts ?? 0
+            }
+            return { isSubj: true, qid: matchedQ?.id, baseline }
           }
           const opt = document.querySelector('.opt')
           if (opt) {
             opt.click()
-            return false
+            return { isSubj: false }
           }
           const jb = document.querySelector('.judge-btn')
           if (jb) jb.click()
-          return false
+          return { isSubj: false }
         })
+
+        if (questionInfo.isSubj) {
+          answeredSubjBaselineAttempts = questionInfo.baseline
+        }
 
         // Submit answer
         await p.evaluate(() => {
@@ -1598,7 +1616,7 @@ test('browser E2E', async (t) => {
         await new Promise((r) => setTimeout(r, 600))
         submittedCount++
 
-        if (isSubj) {
+        if (questionInfo.isSubj) {
           subjectiveTested = true
           // Must find the AI review button without soft skipping
           const clickedGrade = await p.evaluate(() => {
@@ -1644,12 +1662,13 @@ test('browser E2E', async (t) => {
       // 3. Strict assert: mock gateway must have actually received the AI grade request
       assert.equal(aiGradeRequestReceived, true, 'AI mock server must have actually received /ai/grade request')
 
-      // 4. Assert IndexedDB data integrity and session ID consistency
+      // 4. Assert IndexedDB data integrity, session ID consistency, and actual writes
       const stats = await p.evaluate(async () => {
         const dbmod = await import('/src/db/database.ts')
         const allHistory = await dbmod.db.history.toArray()
         const planHistory = allHistory.filter((h) => h.mode === 'plan')
         const sessionIds = Array.from(new Set(planHistory.map((h) => h.sessionId)))
+        const distinctQids = Array.from(new Set(planHistory.map((h) => h.qid)))
         const allAiReviews = await dbmod.db.aiReviews.toArray()
         const allRecords = await dbmod.db.records.toArray()
         const aiReview = allAiReviews[0]
@@ -1659,12 +1678,23 @@ test('browser E2E', async (t) => {
           allRecords,
           planHistory,
           planHistoryCount: planHistory.length,
+          distinctQids,
           uniqueSessionIds: sessionIds.length,
           sessionIds,
           aiReviewCount: allAiReviews.length,
           aiReview,
         }
       })
+
+      // Strict assert on real IndexedDB writes: at least 2 real answers persisted with distinct qids
+      assert.ok(
+        stats.planHistoryCount >= 2,
+        `IndexedDB must have at least 2 real answers persisted under mode 'plan', got ${stats.planHistoryCount}`,
+      )
+      assert.ok(
+        stats.distinctQids.length >= 2,
+        `IndexedDB plan history must correspond to at least 2 distinct question IDs, got ${stats.distinctQids.length} (${JSON.stringify(stats.distinctQids)})`,
+      )
 
       // Must have persisted AI review in IndexedDB
       assert.ok(stats.aiReview, 'AI review must be persisted in IndexedDB aiReviews table')
@@ -1695,13 +1725,14 @@ test('browser E2E', async (t) => {
         'AI review row id deterministically binds to identical session ID',
       )
 
-      // Strict assert: subjective question attempts count increased exactly once
+      // Strict assert: subjective question attempts count increased strictly by 1 (baseline + 1), never duplicated by AI review
       const subjRecord = stats.allRecords.find((r) => r.qid === answeredSubjQid)
       assert.ok(subjRecord, 'subjective record exists in db')
+      const expectedAttempts = answeredSubjBaselineAttempts + 1
       assert.equal(
         subjRecord.attempts,
-        1,
-        'subjective question attempts must be exactly 1 for a new attempt, not duplicated by AI review',
+        expectedAttempts,
+        `subjective attempts (${subjRecord.attempts}) must strictly equal baseline (${answeredSubjBaselineAttempts}) + 1 = ${expectedAttempts}, never duplicated by AI review`,
       )
 
       mockServer.close()
