@@ -145,6 +145,12 @@ export const RULES = [
  * Paths that must NEVER be committed, independent of their content.
  * `.gitignore` alone is not a guarantee (`git add -f` bypasses it), so the gate
  * checks the candidate path list directly.
+ *
+ * `sensitiveName: true` marks a rule whose matched path EMBEDS variable, private
+ * content (a document title). Such a path is redacted in the report. Rules that
+ * match fixed, generic names — repository constants or dotted `.env` variants —
+ * are reported verbatim, because naming them discloses nothing and keeps the
+ * report actionable.
  */
 export const FORBIDDEN_PATHS = [
   { id: 'private-course-bank', match: (p) => p === 'data/bank.json' },
@@ -154,11 +160,21 @@ export const FORBIDDEN_PATHS = [
   { id: 'ai-gateway-credentials', match: (p) => p === 'server/ai-config.json' },
   {
     id: 'environment-secrets',
-    // `.env`, `.env.local`, `.env.production` … but NOT the placeholder example.
-    match: (p) => /(^|\/)\.env(\.[A-Za-z0-9_-]+)?$/.test(p) && !/\.env\.example$/.test(p),
+    // Any `.env` or dotted variant (`.env.local`, `.env.production.local`,
+    // `.env.development.local`, …), case-insensitively and at any depth.
+    // Credential-free templates (`.env.example`, `.env.sample`, `.env.template`)
+    // stay allowed.
+    match: (p) => {
+      const base = p.split('/').pop().toLowerCase()
+      if (/^\.env\.(example|sample|template)$/.test(base)) return false
+      return base === '.env' || base.startsWith('.env.')
+    },
   },
   {
     id: 'private-source-pdf',
+    // The file NAME is itself the private datum (e.g. a titled course document),
+    // so it must never be echoed into a log.
+    sensitiveName: true,
     match: (p) => /\.pdf$/i.test(p) && !/^data\/sample-/.test(p),
   },
   { id: 'local-backup-data', match: (p) => /\.exampilot-backup\.json$/i.test(p) },
@@ -178,17 +194,37 @@ export const FILE_ALLOW = [
 ]
 
 const BINARY_EXT = /\.(png|jpe?g|gif|webp|ico|woff2?|ttf|eot|zip|gz)$/i
-// Generated lockfiles carry registry URLs and integrity hashes by design and no
-// author prose; `npm ci` verifies their integrity instead.
-const SKIP_CONTENT = [/^package-lock\.json$/]
+
+/**
+ * Generated lockfiles are still scanned for SECRET material — a credential
+ * written into one is a real leak. Only the vocabulary-style rules are skipped
+ * there, because registry URLs, integrity hashes and package names would
+ * otherwise produce noise that is not an author disclosure.
+ */
+const LOCKFILE = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json)$/
+export const LOCKFILE_SKIPPED_RULES = RULES.filter((r) => r.severity !== 'SECRET').map((r) => r.id)
 
 export function fileAllows(rule, file) {
   return FILE_ALLOW.some((a) => a.file.test(file) && a.rules.includes(rule.id))
 }
 
-/** True when the path itself looks sensitive and must not be printed verbatim. */
-export function isSensitivePath(path) {
-  return RULES.some((r) => r.severity !== 'REVIEW' && r.re.test(path))
+/**
+ * True when a path's NAME is itself sensitive and must not be printed.
+ *
+ * Two sources of sensitivity:
+ *   1. rules flagged `sensitiveName`, whose matched path embeds private content
+ *      (e.g. a titled document — a real git path carries no quotes, so the
+ *      content rules alone would miss it);
+ *   2. content rules that can match inside a filename (local user paths,
+ *      personal email).
+ *
+ * Fixed, generic names (`data/bank.json`, `.env.production.local`) are NOT
+ * redacted: naming them discloses nothing and keeps the report actionable.
+ */
+export function isSensitivePath(p) {
+  if (!p) return false
+  if (FORBIDDEN_PATHS.some((rule) => rule.sensitiveName && rule.match(p))) return true
+  return RULES.some((r) => r.severity !== 'REVIEW' && r.re.test(p))
 }
 
 // ---------------------------------------------------------------------------
@@ -383,12 +419,25 @@ function safePath(path) {
   return isSensitivePath(path) ? '(redacted path — its name matches a sensitive pattern)' : path
 }
 
-export function render({ mode, rev, contentScanned, metadataScanned, contentLabel, findings, forbidden }) {
+export function render({
+  mode,
+  rev,
+  contentScanned,
+  metadataScanned,
+  metadataScope,
+  contentLabel,
+  findings,
+  forbidden,
+}) {
   const lines = []
   lines.push('public-information gate')
   lines.push(`  mode            : ${mode}${rev ? ` (${rev})` : ''}`)
   lines.push(`  ${contentLabel}`)
-  lines.push(`  commit metadata : ${metadataScanned} commit message(s)`)
+  lines.push(
+    `  commit metadata : ${metadataScanned} commit message(s)${
+      metadataScanned ? ` — scope: ${metadataScope || 'HEAD'}` : ''
+    }`,
+  )
   lines.push('')
   lines.push('  Note: findings below never include matched text, so detected credentials')
   lines.push('  or personal data are not re-disclosed into this log.')
@@ -478,10 +527,16 @@ export function run(argv = process.argv.slice(2)) {
   }
   let findings = []
   let contentScanned = 0
+  let lockfilesScanned = 0
   for (const t of targets) {
     if (BINARY_EXT.test(t.path)) continue
-    if (SKIP_CONTENT.some((re) => re.test(t.path))) continue
     contentScanned++
+    if (LOCKFILE.test(t.path)) {
+      // Lockfiles: SECRET rules still run; only vocabulary rules are skipped.
+      lockfilesScanned++
+      findings = findings.concat(scanText(t.text, t.path, t.path, { skipRules: LOCKFILE_SKIPPED_RULES }))
+      continue
+    }
     findings = findings.concat(scanText(t.text, t.path, t.path))
   }
 
@@ -489,27 +544,33 @@ export function run(argv = process.argv.slice(2)) {
   const forbidden = checkForbiddenPaths(targets.map((t) => t.path))
 
   let metadataScanned = 0
+  let metadataScope = ''
   if (metadata) {
-    const revs = mode === 'all-refs' ? '--all' : 'HEAD'
+    // The metadata scope must follow the SELECTED revision:
+    //   all-refs -> every ref;  --commit <rev> -> that revision's ancestry;
+    //   worktree/index -> HEAD (there is no other revision in play).
+    const revs = mode === 'all-refs' ? '--all' : mode === 'commit' && rev ? rev : 'HEAD'
     const commits = commitMessages(revs)
     metadataScanned = commits.length
+    metadataScope = mode === 'all-refs' ? 'all refs' : revs === 'HEAD' ? 'HEAD' : `ancestry of ${revs}`
     findings = findings.concat(scanCommitMetadata(commits))
   }
 
   const contentLabel =
     mode === 'worktree'
-      ? `worktree content  : ${contentScanned} file(s) from the working tree`
+      ? `worktree content  : ${contentScanned} file(s) from the working tree${lockfilesScanned ? ` (incl. ${lockfilesScanned} lockfile, SECRET rules only)` : ''}`
       : mode === 'commit'
-        ? `commit content  : ${contentScanned} file(s) in ${rev}`
+        ? `commit content  : ${contentScanned} file(s) in ${rev}${lockfilesScanned ? ` (incl. ${lockfilesScanned} lockfile, SECRET rules only)` : ''}`
         : mode === 'all-refs'
-          ? `all-refs content: ${contentScanned} unique blob(s) across every ref`
-          : `staged content  : ${contentScanned} file(s) from the index (what a commit would publish)`
+          ? `all-refs content: ${contentScanned} unique blob(s) across every ref${lockfilesScanned ? ` (incl. ${lockfilesScanned} lockfile, SECRET rules only)` : ''}`
+          : `staged content  : ${contentScanned} file(s) from the index (what a commit would publish)${lockfilesScanned ? ` (incl. ${lockfilesScanned} lockfile, SECRET rules only)` : ''}`
 
   const { text, blocking } = render({
     mode,
     rev,
     contentScanned,
     metadataScanned,
+    metadataScope,
     contentLabel,
     findings,
     forbidden,

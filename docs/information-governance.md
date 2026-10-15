@@ -105,11 +105,13 @@
 
 三种检查对象分别处理：
 
-- **当前/暂存内容**：默认检查暂存区，因此「暂存后修改工作区」不会造成漏检；CI 使用 `--commit "${{ github.sha }}"` 检查实际提交内容。
-- **提交元数据**：单独扫描提交信息，与内容扫描分开报告；可用 `--no-metadata` 关闭。
-- **禁止提交的文件路径**：`data/bank.json`、`data/local-bank.json`、`src/lib/local-bank.generated.ts`、`tools/pdf_text.txt`、`server/ai-config.json`、真实 `.env`、私人来源 PDF 等，**按路径硬阻断**。`.gitignore` 可被 `git add -f` 绕过，因此不依赖它。
+- **当前/暂存内容**：默认检查暂存区，因此「暂存后修改工作区」不会造成漏检；CI 使用 `--commit HEAD` 检查实际提交内容。
+- **提交元数据**：单独扫描提交信息，与内容扫描分开报告，并注明**元数据范围**（`HEAD` / 所选修订的祖先 / 全部 ref）。`--commit <rev>` 按所选修订扫描其祖先提交，不固定读取 `HEAD`；可用 `--no-metadata` 关闭。
+- **禁止提交的文件路径**：`data/bank.json`、`data/local-bank.json`、`src/lib/local-bank.generated.ts`、`tools/pdf_text.txt`、`server/ai-config.json`、**全部 `.env` 及点号变体**（`.env.local`、`.env.production.local`、`.env.development.local` 等，任意层级、不区分大小写）、私人来源 PDF 等，**按路径硬阻断**。`.gitignore` 可被 `git add -f` 绕过，因此不依赖它。明确允许的无凭据模板为 `.env.example`、`.env.sample`、`.env.template`。
 
-输出安全：命中项**只输出规则 ID、路径与规则说明，绝不输出匹配到的原文**，避免把检测到的凭据、私人路径或个人信息再次写入 CI 日志；路径本身匹配敏感规则时也会被遮蔽。
+锁文件（`package-lock.json`、`npm-shrinkwrap.json`）**不是扫描盲区**：其中的 `SECRET` 规则照常执行，仅跳过易产生噪音的词汇类规则（注册表 URL 与完整性哈希不构成作者披露）。
+
+输出安全：命中项**只输出规则 ID、路径与规则说明，绝不输出匹配到的原文**，避免把检测到的凭据、私人路径或个人信息再次写入 CI 日志。据此，**文件名本身即私人信息的路径（如私人来源文档）一律遮蔽为「redacted path」**；固定且通用的路径（`data/bank.json`、`.env.production.local`）照常显示，因为指出它们不泄露任何私人内容，且便于修复。
 
 严重级别：`SECRET` / `INTERNAL` 命中与禁止路径均使构建失败；`REVIEW` 级仅提示，需人工确认。
 

@@ -364,3 +364,186 @@ test('gate: a secret removed by a later commit is gone from --commit but still i
   assert.ok(!all.out.includes(FAKE_KEY))
   assert.match(all.out, /unique blob/)
 })
+
+// ---------------------------------------------------------------------------
+// Boundary fix 1 — a forbidden path's NAME must never be printed
+//
+// Regression: safePath() relied on the content rules, and the source-document
+// rule requires quotes, so a real (unquoted) git path was printed verbatim.
+// ---------------------------------------------------------------------------
+
+test('gate: a blocked private PDF filename is REDACTED in the report', () => {
+  const d = repo()
+  // A realistic Chinese private-document name, assembled at runtime.
+  const cnName =
+    '2026-2027-1' + '\uFF1A' + '\u4E60\u601D\u60F3\u9898\u5E93\u6C47\u603B' + '\uFF0820261010\uFF09' + PDF_EXT
+  writeFileSync(path.join(d, cnName), 'innocent content\n')
+  gitIn(d, ['add', '-A'])
+
+  const { code, out } = runGateRaw(d, ['--index', '--no-metadata'])
+  assert.equal(code, 1, 'a private PDF must be blocked')
+  assert.ok(!out.includes(cnName), 'the raw private filename must NOT be printed')
+  // No .pdf name at all may survive anywhere in the output.
+  assert.ok(!/[\w\u4e00-\u9fff\uFF00-\uFFEF-]+\.pdf/i.test(out), 'no document name may appear in the log')
+  assert.match(out, /redacted path/, 'a redaction marker must be present')
+  assert.match(out, /private-source-pdf/, 'the rule id must still be reported')
+})
+
+test('gate: an ASCII private PDF filename is also redacted', () => {
+  const d = repo()
+  const name = 'internal-question-bank-2026' + PDF_EXT
+  writeFileSync(path.join(d, name), 'innocent\n')
+  gitIn(d, ['add', '-A'])
+  const { code, out } = runGateRaw(d, ['--index', '--no-metadata'])
+  assert.equal(code, 1)
+  assert.ok(!out.includes(name), 'the filename must not be printed')
+  assert.match(out, /redacted path/)
+})
+
+test('gate: non-sensitive forbidden paths are still named for actionability', () => {
+  const d = repo()
+  mkdirSync(path.join(d, 'data'), { recursive: true })
+  writeFileSync(path.join(d, 'data', 'bank.json'), '{}\n')
+  gitIn(d, ['add', '-A'])
+  const { code, out } = runGateRaw(d, ['--index', '--no-metadata'])
+  assert.equal(code, 1)
+  // Ordinary repo paths are not secret; naming them is what makes the report useful.
+  assert.match(out, /data\/bank\.json/)
+})
+
+// ---------------------------------------------------------------------------
+// Boundary fix 2 — every common .env variant is blocked by PATH
+// ---------------------------------------------------------------------------
+
+const ENV_BLOCKED = [
+  '.env',
+  '.env.local',
+  '.env.production',
+  '.env.development',
+  '.env.test',
+  '.env.staging',
+  '.env.production.local',
+  '.env.development.local',
+  '.env.test.local',
+  '.env.staging.local',
+  '.env.production.local.bak',
+  'config/.env.production.local',
+  'a/b/.env',
+  '.ENV',
+  '.ENV.LOCAL',
+  '.env.LOCAL',
+  '.Env.Production.Local',
+]
+
+for (const name of ENV_BLOCKED) {
+  test(`gate: blocks .env variant "${name}" by path`, () => {
+    const d = repo()
+    const full = path.join(d, name)
+    mkdirSync(path.dirname(full), { recursive: true })
+    // Deliberately innocuous content: the PATH must be what blocks it.
+    writeFileSync(full, 'PLACEHOLDER=hello\n')
+    gitIn(d, ['add', '-A'])
+    const { code, out } = runGateRaw(d, ['--index', '--no-metadata'])
+    assert.equal(code, 1, `${name} must be blocked by path, not content`)
+    assert.match(out, /FORBIDDEN PATH/)
+    assert.match(out, /environment-secrets/)
+  })
+}
+
+const ENV_ALLOWED = ['.env.example', '.env.sample', '.env.template', 'config/.env.example', 'docs/env.md']
+
+for (const name of ENV_ALLOWED) {
+  test(`gate: allows credential-free template "${name}"`, () => {
+    const d = repo()
+    const full = path.join(d, name)
+    mkdirSync(path.dirname(full), { recursive: true })
+    writeFileSync(full, '# placeholders only\nAI_API_KEY=your-api-key-here\n')
+    gitIn(d, ['add', '-A'])
+    const { code, out } = runGateRaw(d, ['--index', '--no-metadata'])
+    assert.equal(code, 0, `${name} must remain allowed:\n${out}`)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Boundary fix 3 — lockfiles must not be a secret blind spot
+// ---------------------------------------------------------------------------
+
+test('gate: a credential injected into package-lock.json IS detected', () => {
+  const d = repo()
+  writeFileSync(path.join(d, 'package-lock.json'), JSON.stringify({ injected: FAKE_KEY }, null, 2))
+  gitIn(d, ['add', '-A'])
+  const { code, out } = runGateRaw(d, ['--index', '--no-metadata'])
+  assert.equal(code, 1, 'a credential in a lockfile must fail the gate')
+  assert.match(out, /credential-literal/)
+  assert.ok(!out.includes(FAKE_KEY), 'the raw value must not be printed')
+})
+
+test('gate: a real npm lockfile still passes (no lockfile false positives)', () => {
+  const d = repo()
+  writeFileSync(path.join(d, 'package-lock.json'), readFileSync(path.join(ROOT, 'package-lock.json')))
+  gitIn(d, ['add', '-A'])
+  const { code, out } = runGateRaw(d, ['--index', '--no-metadata'])
+  assert.equal(code, 0, `an ordinary lockfile must pass:\n${out.slice(0, 800)}`)
+  assert.match(out, /lockfile/, 'the report must state that a lockfile was scanned')
+})
+
+test('gate: vocabulary rules are still skipped in lockfiles, SECRET rules are not', () => {
+  const d = repo()
+  // A tool name inside a lockfile must not fail the build...
+  writeFileSync(path.join(d, 'package-lock.json'), JSON.stringify({ note: FAKE_AGENT }, null, 2))
+  gitIn(d, ['add', '-A'])
+  assert.equal(runGateRaw(d, ['--index', '--no-metadata']).code, 0, 'vocabulary is noise in a lockfile')
+
+  // ...but a credential in the same file must.
+  writeFileSync(path.join(d, 'package-lock.json'), JSON.stringify({ note: FAKE_AGENT, k: FAKE_KEY }, null, 2))
+  gitIn(d, ['add', '-A'])
+  const { code, out } = runGateRaw(d, ['--index', '--no-metadata'])
+  assert.equal(code, 1, 'SECRET rules must still apply inside lockfiles')
+  assert.ok(!out.includes(FAKE_KEY))
+})
+
+// ---------------------------------------------------------------------------
+// Boundary fix 4 — metadata scope follows the SELECTED revision
+//
+// Regression: the metadata scan was hardcoded to HEAD, so `--commit <old>`
+// reported HEAD's messages regardless of the revision under inspection.
+// ---------------------------------------------------------------------------
+
+test("gate: --commit <rev> scans THAT revision's metadata, not HEAD", () => {
+  const d = repo()
+  writeFileSync(path.join(d, 'a.txt'), 'a\n')
+  gitIn(d, ['add', '-A'])
+  gitIn(d, ['commit', '-q', '-m', 'commit A clean'])
+  const shaA = gitIn(d, ['rev-parse', 'HEAD']).trim()
+
+  writeFileSync(path.join(d, 'b.txt'), 'b\n')
+  gitIn(d, ['add', '-A'])
+  gitIn(d, ['commit', '-q', '-m', `commit B with ${FAKE_TOKEN}`])
+  const shaB = gitIn(d, ['rev-parse', 'HEAD']).trim()
+
+  writeFileSync(path.join(d, 'c.txt'), 'c\n')
+  gitIn(d, ['add', '-A'])
+  gitIn(d, ['commit', '-q', '-m', 'commit C clean'])
+  const shaC = gitIn(d, ['rev-parse', 'HEAD']).trim()
+
+  // Selecting the clean ANCESTOR must pass: its ancestry holds no secret.
+  const atA = runGateRaw(d, ['--commit', shaA])
+  assert.equal(atA.code, 0, 'the selected revision A and its ancestors are clean')
+  assert.ok(!atA.out.includes(FAKE_TOKEN))
+  assert.match(atA.out, /scope: ancestry of/)
+
+  // Selecting the revision that contains the secret must fail.
+  const atB = runGateRaw(d, ['--commit', shaB])
+  assert.equal(atB.code, 1, 'revision B introduced the secret')
+  assert.ok(!atB.out.includes(FAKE_TOKEN), 'the token must never be printed')
+
+  // And HEAD (which has B in its ancestry) must also fail.
+  const atC = runGateRaw(d, ['--commit', shaC])
+  assert.equal(atC.code, 1, 'B is an ancestor of C')
+  assert.ok(!atC.out.includes(FAKE_TOKEN))
+
+  // The scope line must differ, proving it is not pinned to HEAD.
+  const scopeA = (atA.out.match(/scope: [^\n]*/) || [''])[0]
+  const scopeC = (atC.out.match(/scope: [^\n]*/) || [''])[0]
+  assert.notEqual(scopeA, scopeC, 'the reported scope must reflect the selected revision')
+})
