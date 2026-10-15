@@ -84,3 +84,6 @@ tools/verify-sample-originality.mjs
 
 # ---- E2E upload scratch ----
 tools/.e2e-uploads/
+
+# ---- local scratch ----
+commit-msg.txt
