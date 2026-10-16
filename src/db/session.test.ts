@@ -615,3 +615,201 @@ describe('attempt identity across real paths (scenarios A–D)', () => {
     expect((await snapshotDb(db)).records.find((r) => r.qid === subj.id)?.attempts).toBe(2)
   })
 })
+
+/**
+ * Subjective spaced repetition across the three real write paths.
+ *
+ * These lock in the rule that subjective training moves ONLY the attempt count
+ * and the review interval: no correctness is inferred, no mastery is granted,
+ * and the interval grows on its own slower curve.
+ */
+describe('subjective spaced repetition (S1-S8)', () => {
+  const DAY = 86400000
+  const subjQ = mkq('subj-q', 'short')
+  const rec = (qid: string) => async () => (await snapshotDb(db)).records.find((r) => r.qid === qid)
+
+  it('S1: recordAttempt advances the interval on its own curve', async () => {
+    const seen: number[] = []
+    for (let i = 0; i < 5; i++) {
+      await recordAttempt(db, {
+        sessionId: `sess-S1-${i}`, // a different session each time = a new attempt
+        qid: subjQ.id,
+        answer: '作答',
+        mode: 'subjective',
+        isCorrect: null,
+        usedAI: false,
+        now: 1000 + i * DAY,
+      })
+      seen.push((await rec(subjQ.id)())!.intervalDays)
+    }
+    expect(seen).toEqual([1, 2, 3, 5, 8])
+  })
+
+  it('S2: repeating the same (sessionId, qid) advances the interval exactly once', async () => {
+    for (let i = 0; i < 3; i++) {
+      const out = await recordAttempt(db, {
+        sessionId: 'sess-S2',
+        qid: subjQ.id,
+        answer: '作答',
+        mode: 'subjective',
+        isCorrect: null,
+        usedAI: false,
+        now: 1000 + i * DAY,
+      })
+      expect(out.created).toBe(i === 0)
+    }
+    const r = (await rec(subjQ.id)())!
+    expect(r.attempts).toBe(1)
+    expect(r.intervalDays).toBe(1)
+  })
+
+  it('S3: replaying the same mock run does not advance the interval', async () => {
+    const input = baseInput({ runId: 'run-S3', submissions: { q1: null, q2: null, q3: null, q4: '简答' } })
+    const first = await submitMockRun(db, input)
+    const second = await submitMockRun(db, input)
+    expect(first.status).toBe('committed')
+    expect(second.status).toBe('already-submitted')
+    expect(second.written.records).toBe(0)
+    const r = (await rec('q4')())!
+    expect(r.attempts).toBe(1)
+    expect(r.intervalDays).toBe(1)
+    expect(r.nextReviewAt).toBe(2000 + DAY)
+  })
+
+  it('S4: an AI review after a subjective attempt does NOT advance the interval', async () => {
+    await recordAttempt(db, {
+      sessionId: 'sess-S4',
+      qid: subjQ.id,
+      answer: '作答',
+      mode: 'subjective',
+      isCorrect: null,
+      usedAI: false,
+      now: 1000,
+    })
+    const before = (await rec(subjQ.id)())!
+
+    await saveAiReviewWithAttempt(db, {
+      sessionId: 'sess-S4',
+      qid: subjQ.id,
+      question: subjQ,
+      userAnswer: '作答',
+      provider: 'stub',
+      model: 'm',
+      result: GRADE,
+      now: 5000,
+    })
+    // ...and again, to prove it is not just the first review.
+    await saveAiReviewWithAttempt(db, {
+      sessionId: 'sess-S4',
+      qid: subjQ.id,
+      question: subjQ,
+      userAnswer: '作答',
+      provider: 'stub',
+      model: 'm',
+      result: GRADE,
+      now: 9000,
+    })
+
+    const after = (await rec(subjQ.id)())!
+    expect(after.attempts).toBe(before.attempts)
+    expect(after.nextReviewAt).toBe(before.nextReviewAt)
+    expect(after.intervalDays).toBe(before.intervalDays)
+    expect((await snapshotDb(db)).aiReviews).toHaveLength(1) // one row, updated
+  })
+
+  it('S5: a first-time AI review on an unanswered question creates one attempt', async () => {
+    const out = await saveAiReviewWithAttempt(db, {
+      sessionId: 'sess-S5',
+      qid: subjQ.id,
+      question: subjQ,
+      userAnswer: '作答',
+      provider: 'stub',
+      model: 'm',
+      result: GRADE,
+      now: 1000,
+    })
+    expect(out.attemptCreated).toBe(true)
+    const r = (await rec(subjQ.id)())!
+    expect(r.attempts).toBe(1)
+    expect(r.intervalDays).toBe(1)
+    expect(r.lastCorrect).toBe(null)
+  })
+
+  it('S6: many subjective trainings never grant mastery or struggling', async () => {
+    for (let i = 0; i < 30; i++) {
+      await recordAttempt(db, {
+        sessionId: `sess-S6-${i}`,
+        qid: subjQ.id,
+        answer: '作答',
+        mode: 'subjective',
+        isCorrect: null,
+        usedAI: false,
+        now: 1000 + i * DAY,
+      })
+    }
+    const r = (await rec(subjQ.id)())!
+    expect(r.attempts).toBe(30)
+    expect(r.status).toBe('learning')
+    expect(r.status).not.toBe('mastered')
+    expect(r.status).not.toBe('struggling')
+    expect(r.intervalDays).toBe(30) // capped
+    expect(r.correctCount).toBe(0)
+    expect(r.wrongCount).toBe(0)
+  })
+
+  it('S7: a subjective attempt does not wipe existing objective counters', async () => {
+    // Train the question objectively first.
+    await recordAttempt(db, {
+      sessionId: 'sess-S7-obj',
+      qid: subjQ.id,
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 1000,
+    })
+    const before = (await rec(subjQ.id)())!
+    expect(before.correctCount).toBe(1)
+
+    await recordAttempt(db, {
+      sessionId: 'sess-S7-subj',
+      qid: subjQ.id,
+      answer: '我的简答',
+      mode: 'subjective',
+      isCorrect: null,
+      usedAI: false,
+      now: 2000,
+    })
+    const after = (await rec(subjQ.id)())!
+    expect(after.correctCount).toBe(before.correctCount)
+    expect(after.wrongCount).toBe(before.wrongCount)
+    expect(after.attempts).toBe(before.attempts + 1)
+    expect(after.lastCorrect).toBe(null)
+  })
+
+  it('S8: subjective records pass export validation', async () => {
+    const { parseExport } = await import('../lib/io')
+    for (let i = 0; i < 3; i++) {
+      await recordAttempt(db, {
+        sessionId: `sess-S8-${i}`,
+        qid: subjQ.id,
+        answer: '作答',
+        mode: 'subjective',
+        isCorrect: null,
+        usedAI: false,
+        now: 1000 + i * DAY,
+      })
+    }
+    const r = (await rec(subjQ.id)())!
+    const res = parseExport(
+      JSON.stringify({
+        schema: 'exampilot.export.v1',
+        records: [r],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+      }),
+    )
+    expect(res.ok).toBe(true)
+  })
+})

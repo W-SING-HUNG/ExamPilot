@@ -151,11 +151,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         // Read the authoritative row INSIDE the transaction: the React snapshot
         // may be stale (concurrent tab, or a write not yet refreshed).
         const current = (await db.records.get(q.id)) ?? freshRecord(q.id, now)
-        const merged: QRecord = applyAttempt(
-          { ...current, ease: Math.max(current.ease, settings.reviewIntervalBase) },
-          isCorrect === true,
-          now,
-        )
+        const merged: QRecord = applyAttempt(current, isCorrect === true, now, settings.reviewIntervalBase)
         merged.lastAnswer = answer ?? null
         merged.lastCorrect = isCorrect
         await db.records.put(merged)
@@ -214,7 +210,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return out
       },
       submitMockRun: async (input) => {
-        const out = await submitMockRunTx(db, input)
+        const out = await submitMockRunTx(db, { ...input, easeFloor: settings.reviewIntervalBase })
         await refresh()
         return { status: out.status, run: out.run }
       },

@@ -1,7 +1,10 @@
 import type { ExamPilotDB } from '../db/database'
 import type { AiGradeResult, HistoryEntry, MockConfig, MockRun, QRecord, Question } from './types'
 import { gradeMockSubmission } from './mock-grading'
-import { applyAttempt, freshRecord } from './scheduler'
+import { applyAttempt, applySubjectiveAttempt, freshRecord } from './scheduler'
+
+/** Interval floor used when no settings value is supplied. Matches DEFAULT_EASE. */
+const DEFAULT_EASE_FLOOR = 2.0
 
 export interface SubmitMockInput {
   /** Stable id for this exam attempt; re-submitting the same id is a no-op. */
@@ -11,6 +14,8 @@ export interface SubmitMockInput {
   config: MockConfig
   startedAt: number
   endedAt: number
+  /** Interval floor from settings, so a mock exam paces like every other mode. */
+  easeFloor?: number
 }
 
 export interface SubmitMockResult {
@@ -68,6 +73,15 @@ export async function hasAttempt(db: ExamPilotDB, sessionId: string, qid: string
  * Idempotent per (sessionId, qid): if any attempt for that pair already exists
  * (including legacy random-id rows), nothing is added and `created: false` is
  * returned. The learning record is only advanced when a new attempt is created.
+ *
+ * `isCorrect === null` (subjective / AI review) advances ONLY the attempt count
+ * and the review interval through `applySubjectiveAttempt`: no correctness is
+ * inferred, no mastery status is granted, and the interval grows on its own
+ * slower curve.
+ *
+ * `easeFloor` is the user's `settings.reviewIntervalBase`. It is applied on
+ * every graded write so the same question behaves identically here and in
+ * `StoreContext.submitAnswer`.
  */
 export async function recordAttempt(
   db: ExamPilotDB,
@@ -79,9 +93,11 @@ export async function recordAttempt(
     isCorrect: boolean | null
     usedAI: boolean
     now?: number
+    easeFloor?: number
   },
 ): Promise<{ created: boolean }> {
   const now = input.now ?? Date.now()
+  const easeFloor = input.easeFloor ?? DEFAULT_EASE_FLOOR
   let created = false
 
   await db.transaction('rw', db.records, db.history, async () => {
@@ -91,20 +107,10 @@ export async function recordAttempt(
     const current = (await db.records.get(input.qid)) ?? freshRecord(input.qid, now)
     const next: QRecord =
       input.isCorrect === null
-        ? {
-            ...current,
-            attempts: current.attempts + 1,
-            lastSeenAt: now,
-            lastCorrect: null,
-            lastAnswer: input.answer,
-            nextReviewAt: now + 24 * 3600 * 1000,
-          }
-        : (() => {
-            const applied = applyAttempt(current, input.isCorrect === true, now)
-            applied.lastAnswer = input.answer
-            applied.lastCorrect = input.isCorrect
-            return applied
-          })()
+        ? applySubjectiveAttempt(current, now)
+        : applyAttempt(current, input.isCorrect === true, now, easeFloor)
+    next.lastAnswer = input.answer
+    if (input.isCorrect !== null) next.lastCorrect = input.isCorrect
     await db.records.put(next)
 
     await db.history.put({
@@ -138,6 +144,7 @@ export async function recordAttempt(
  */
 export async function submitMockRun(db: ExamPilotDB, input: SubmitMockInput): Promise<SubmitMockResult> {
   const { runId, paper, submissions, config, startedAt, endedAt } = input
+  const easeFloor = input.easeFloor ?? DEFAULT_EASE_FLOOR
   const graded = gradeMockSubmission(paper, submissions, config)
 
   const run: MockRun = {
@@ -169,7 +176,7 @@ export async function submitMockRun(db: ExamPilotDB, input: SubmitMockInput): Pr
     for (const { q, answer } of graded.persisted) {
       const current = (await db.records.get(q.id)) ?? freshRecord(q.id, endedAt)
       const isCorrect = graded.perQuestion[q.id]?.isCorrect ?? null
-      const next: QRecord = applyAttempt(current, isCorrect === true, endedAt)
+      const next: QRecord = applyAttempt(current, isCorrect === true, endedAt, easeFloor)
       next.lastAnswer = answer
       next.lastCorrect = isCorrect
       await db.records.put(next)
@@ -190,16 +197,13 @@ export async function submitMockRun(db: ExamPilotDB, input: SubmitMockInput): Pr
     }
 
     // Answered subjective questions count as a training attempt (no score).
+    // Only the attempt count and the review interval move; nothing is scored
+    // and no mastery status is granted.
     for (const { q, answer } of graded.subjective) {
       const current = (await db.records.get(q.id)) ?? freshRecord(q.id, endedAt)
-      await db.records.put({
-        ...current,
-        attempts: current.attempts + 1,
-        lastSeenAt: endedAt,
-        lastCorrect: null,
-        lastAnswer: answer,
-        nextReviewAt: endedAt + 24 * 3600 * 1000,
-      })
+      const next: QRecord = applySubjectiveAttempt(current, endedAt)
+      next.lastAnswer = answer
+      await db.records.put(next)
       written.records++
 
       const entry: HistoryEntry = {
@@ -261,17 +265,14 @@ export async function saveAiReviewWithAttempt(
     await db.aiReviews.put({ id: reviewId, qid, userAnswer, createdAt: now, provider, model, result })
 
     // Only a genuinely new attempt for this (sessionId, qid) moves the counters.
+    // Re-reviewing an already-answered question updates the review row ONLY —
+    // it never advances the attempt count or the review interval.
     if (!(await hasAttempt(db, sessionId, qid))) {
       attemptCreated = true
       const current = (await db.records.get(qid)) ?? freshRecord(qid, now)
-      await db.records.put({
-        ...current,
-        attempts: current.attempts + 1,
-        lastSeenAt: now,
-        lastCorrect: null,
-        lastAnswer: userAnswer,
-        nextReviewAt: now + 24 * 3600 * 1000,
-      })
+      const next: QRecord = applySubjectiveAttempt(current, now)
+      next.lastAnswer = userAnswer
+      await db.records.put(next)
       await db.history.put({
         id: attemptIdFor(sessionId, qid),
         qid,

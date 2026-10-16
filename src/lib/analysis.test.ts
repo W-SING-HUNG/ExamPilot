@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import { bank, allQuestions, objectiveQuestions, usingSampleBank } from './bank'
-import type { QRecord } from './types'
-import { freshRecord, applyAttempt } from './scheduler'
+import type { Question, QRecord } from './types'
+import { freshRecord, applyAttempt, applySubjectiveAttempt } from './scheduler'
+import { computeDiagnosis, rankWeakPoints, WEAK_POINT_LIMIT, type ChapterStat } from './analysis'
 
 /**
  * Tests for the PUBLIC sample bank.
@@ -127,5 +128,200 @@ describe('analysis (sample bank)', () => {
     const d = computeDiagnosis(allQuestions, new Map())
     expect(d.types.map((t) => t.type)).toEqual(['single', 'multi', 'judge', 'short', 'material'])
     expect(d.types.reduce((s, t) => s + t.total, 0)).toBe(allQuestions.length)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Chapter totals must include subjective questions
+// ---------------------------------------------------------------------------
+
+describe('analysis / chapter totals', () => {
+  it('chapter totals account for every question, subjective included', () => {
+    const d = computeDiagnosis(allQuestions, new Map())
+    expect(d.chapters.reduce((s, c) => s + c.total, 0)).toBe(allQuestions.length)
+  })
+
+  it('reports subjective questions inside their chapter instead of dropping them', () => {
+    const d = computeDiagnosis(allQuestions, new Map())
+    const subjectiveTotal = allQuestions.filter((q) => q.type === 'short' || q.type === 'material').length
+    expect(d.chapters.reduce((s, c) => s + c.subjectiveTotal, 0)).toBe(subjectiveTotal)
+    expect(d.chapters.reduce((s, c) => s + c.objectiveTotal, 0)).toBe(objectiveQuestions.length)
+  })
+
+  it('keeps coverage measured against objective questions only', () => {
+    // A chapter made only of subjective questions has no objective denominator,
+    // so its coverage is 0 rather than a fabricated ratio.
+    const d = computeDiagnosis(allQuestions, new Map())
+    for (const c of d.chapters) {
+      if (c.objectiveTotal === 0) expect(c.coverage).toBe(0)
+      else expect(c.coverage).toBeLessThanOrEqual(1)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Weak-point classification (R1-R9)
+// ---------------------------------------------------------------------------
+
+/** Build a ChapterStat directly, so the ranking rules can be tested in isolation. */
+function ch(
+  chapter: string,
+  o: Partial<{
+    attempted: number
+    objectiveTotal: number
+    subjectiveTotal: number
+    coverage: number
+    correctRate: number
+    struggling: number
+  }>,
+): ChapterStat {
+  const objectiveTotal = o.objectiveTotal ?? 10
+  const attempted = o.attempted ?? 0
+  return {
+    chapter,
+    total: objectiveTotal + (o.subjectiveTotal ?? 0),
+    objectiveTotal,
+    subjectiveTotal: o.subjectiveTotal ?? 0,
+    attempted,
+    coverage: o.coverage ?? attempted / objectiveTotal,
+    correct: 0,
+    wrong: 0,
+    correctRate: o.correctRate ?? 0,
+    mastered: 0,
+    struggling: o.struggling ?? 0,
+    single: objectiveTotal,
+    multi: 0,
+    judge: 0,
+    subj: o.subjectiveTotal ?? 0,
+  }
+}
+
+describe('weak points / classification', () => {
+  it('R1: an all-wrong chapter is never pushed off the list by untouched chapters', () => {
+    // 1 attempted-but-all-wrong chapter + 8 never-attempted chapters.
+    const allWrong = ch('全错章', { attempted: 10, objectiveTotal: 10, coverage: 1, correctRate: 0 })
+    const untouched = Array.from({ length: 8 }, (_, i) => ch(`未练章${i}`, { attempted: 0, objectiveTotal: 10 }))
+    const ranked = rankWeakPoints([allWrong, ...untouched])
+
+    expect(ranked.length).toBe(WEAK_POINT_LIMIT)
+    expect(ranked[0].chapter).toBe('全错章')
+    expect(ranked[0].kind).toBe('weak')
+    // Untouched chapters may only fill the remaining slots.
+    expect(ranked.filter((w) => w.kind === 'uncovered')).toHaveLength(WEAK_POINT_LIMIT - 1)
+  })
+
+  it('R2: a lone uncovered chapter is listed as uncovered with no rate', () => {
+    const ranked = rankWeakPoints([ch('未练章', { attempted: 0, objectiveTotal: 12, subjectiveTotal: 3 })])
+    expect(ranked).toHaveLength(1)
+    expect(ranked[0].kind).toBe('uncovered')
+    expect(ranked[0].score).toBe(0)
+    expect(ranked[0].detail).toContain('尚未开始练习')
+    expect(ranked[0].detail).toContain('3')
+  })
+
+  it('R3: weak chapters fill the list before uncovered ones', () => {
+    const weak = Array.from({ length: 6 }, (_, i) =>
+      ch(`薄弱章${i}`, { attempted: 5, objectiveTotal: 10, coverage: 0.5, correctRate: 0.2 }),
+    )
+    const uncovered = Array.from({ length: 8 }, (_, i) => ch(`未练章${i}`, { attempted: 0, objectiveTotal: 10 }))
+    const ranked = rankWeakPoints([...weak, ...uncovered])
+    expect(ranked).toHaveLength(WEAK_POINT_LIMIT)
+    expect(ranked.every((w) => w.kind === 'weak')).toBe(true)
+  })
+
+  it('R4: a fully consolidated chapter is not surfaced', () => {
+    const consolidated = ch('巩固章', { attempted: 10, objectiveTotal: 10, coverage: 1, correctRate: 1 })
+    expect(rankWeakPoints([consolidated])).toHaveLength(0)
+  })
+
+  it('R5: an all-wrong chapter scores from its real 0% rate, not a stand-in', () => {
+    const allWrong = ch('全错章', { attempted: 10, objectiveTotal: 10, coverage: 1, correctRate: 0 })
+    expect(rankWeakPoints([allWrong])[0].score).toBe(40)
+    // And the score does not change when untouched chapters are added.
+    const withUntouched = rankWeakPoints([
+      allWrong,
+      ...Array.from({ length: 8 }, (_, i) => ch(`未练章${i}`, { attempted: 0 })),
+    ])
+    expect(withUntouched[0].score).toBe(40)
+  })
+
+  it('R6: an all-wrong chapter reports its real rate', () => {
+    const allWrong = ch('全错章', { attempted: 10, objectiveTotal: 10, coverage: 1, correctRate: 0 })
+    const wp = rankWeakPoints([allWrong])[0]
+    expect(wp.detail).toContain('正确率仅 0%')
+    expect(wp.detail).not.toContain('待进一步巩固')
+  })
+
+  it('R7: uncovered chapters rank by how many questions are still untouched', () => {
+    const small = ch('小未练章', { attempted: 0, objectiveTotal: 10 })
+    const big = ch('大未练章', { attempted: 0, objectiveTotal: 50 })
+    const ranked = rankWeakPoints([small, big])
+    expect(ranked[0].chapter).toBe('大未练章')
+    expect(ranked[1].chapter).toBe('小未练章')
+  })
+
+  it('R8: the two groups are never blended into one score ordering', () => {
+    // A weak chapter scoring 70 must still outrank an uncovered chapter whose
+    // score is 0 — this is the regression that used to hide failures.
+    const weakHigh = ch('高Weak', { attempted: 9, objectiveTotal: 10, coverage: 0.9, correctRate: 0.85 })
+    const uncovered = ch('未练章', { attempted: 0, objectiveTotal: 10 })
+    const ranked = rankWeakPoints([weakHigh, uncovered])
+    expect(ranked[0].chapter).toBe('高Weak')
+    expect(ranked[1].kind).toBe('uncovered')
+  })
+
+  it('R9: every entry carries a kind', () => {
+    const ranked = rankWeakPoints([
+      ch('薄弱章', { attempted: 5, objectiveTotal: 10, coverage: 0.5, correctRate: 0.2 }),
+      ch('未练章', { attempted: 0, objectiveTotal: 10 }),
+    ])
+    expect(ranked.every((w) => w.kind === 'weak' || w.kind === 'uncovered')).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// End-to-end through computeDiagnosis with real records
+// ---------------------------------------------------------------------------
+
+describe('analysis / diagnosis with real attempts', () => {
+  it('an all-wrong chapter outranks untouched chapters in the real diagnosis', () => {
+    const now = Date.now()
+    const recs = new Map<string, QRecord>()
+    const chapterOf = (q: Question) => q.chapter
+    const target = allQuestions.find((q) => q.type !== 'short' && q.type !== 'material')!
+    const targetChapter = chapterOf(target)
+    // Answer every objective question of one chapter wrongly.
+    for (const q of allQuestions) {
+      if (q.chapter === targetChapter && q.type !== 'short' && q.type !== 'material') {
+        recs.set(q.id, applyAttempt(freshRecord(q.id, now), false, now))
+      }
+    }
+    const d = computeDiagnosis(allQuestions, recs)
+    const idx = d.weakPoints.findIndex((w) => w.chapter === targetChapter)
+    expect(idx).toBeGreaterThanOrEqual(0)
+    expect(d.weakPoints[idx].kind).toBe('weak')
+    // The chapter's measured rate really is 0.
+    const stat = d.chapters.find((c) => c.chapter === targetChapter)!
+    expect(stat.correctRate).toBe(0)
+    expect(stat.wrong).toBeGreaterThan(0)
+  })
+
+  it('subjective training never produces a correct rate or a mastered count', () => {
+    const now = Date.now()
+    const recs = new Map<string, QRecord>()
+    for (const q of allQuestions.filter((x) => x.type === 'short' || x.type === 'material')) {
+      let r = freshRecord(q.id, now)
+      for (let i = 0; i < 5; i++) r = applySubjectiveAttempt(r, now + i * 86400000)
+      recs.set(q.id, r)
+    }
+    const d = computeDiagnosis(allQuestions, recs)
+    for (const t of d.types.filter((x) => x.type === 'short' || x.type === 'material')) {
+      expect(t.correctRate).toBe(0)
+      expect(t.correct).toBe(0)
+      expect(t.wrong).toBe(0)
+      expect(t.mastered).toBe(0)
+      expect(t.attempted).toBe(t.total) // trained, but never scored
+    }
+    expect(d.overall.subjectiveAttempted).toBeGreaterThan(0)
   })
 })

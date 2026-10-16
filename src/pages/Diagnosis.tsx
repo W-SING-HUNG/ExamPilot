@@ -1,9 +1,15 @@
 import { useMemo, useState } from 'react'
 import { useStore } from '../store/StoreContext'
 import { allQuestions, objectiveQuestions, subjectiveQuestions, TYPE_LABEL } from '../lib/bank'
-import { computeDiagnosis, groupActivity } from '../lib/analysis'
+import { computeDiagnosis, groupActivity, type WeakPointKind } from '../lib/analysis'
 import { Bar, CardPad, PageHead, Tag, Empty } from '../components/ui'
 import type { RouteName } from '../store/router'
+
+/** Label for the two weak-point kinds; the kinds are never ranked against each other. */
+const KIND_LABEL: Record<WeakPointKind, { text: string; tone: 'bad' | 'warn' }> = {
+  weak: { text: '待清除', tone: 'bad' },
+  uncovered: { text: '未覆盖', tone: 'warn' },
+}
 
 export function Diagnosis({
   nav,
@@ -35,7 +41,6 @@ export function Diagnosis({
         title="学习诊断与薄弱点分析"
         desc="全部指标来自真实作答数据：覆盖率、正确率、错误次数与复习间隔。系统不生成预测分数，也不虚构掌握率。"
       />
-
       <div className="grid grid-4" style={{ marginBottom: 14 }}>
         <CardPad>
           <div className="stat-num">{diag.overall.attempted}</div>
@@ -80,7 +85,7 @@ export function Diagnosis({
                   <th>章节</th>
                   <th>题量</th>
                   <th>已练</th>
-                  <th>覆盖率</th>
+                  <th title="已练客观题 / 本章客观题总数">覆盖率</th>
                   <th>作答</th>
                   <th>答错</th>
                   <th>正确率</th>
@@ -95,7 +100,10 @@ export function Diagnosis({
                     <td>
                       <b>{c.chapter}</b>
                     </td>
-                    <td>{c.total}</td>
+                    <td title={`客观题 ${c.objectiveTotal} 道 · 主观题 ${c.subjectiveTotal} 道`}>
+                      {c.total}
+                      {c.subjectiveTotal > 0 && <span className="muted-2">（主 {c.subjectiveTotal}）</span>}
+                    </td>
                     <td>{c.attempted}</td>
                     <td>
                       <div className="row" style={{ gap: 8 }}>
@@ -206,26 +214,35 @@ export function Diagnosis({
         {diag.weakPoints.length === 0 ? (
           <Empty text="暂无足够数据生成薄弱点排序，先完成一些练习。" />
         ) : (
-          <div className="grid grid-2">
-            {diag.weakPoints.map((w, i) => (
-              <div key={w.chapter} className="card card-pad row-between" style={{ boxShadow: 'none' }}>
-                <div>
-                  <div className="row" style={{ gap: 8 }}>
-                    <b>
-                      {i + 1}. {w.chapter}
-                    </b>
-                    <Tag tone={w.score < 50 ? 'bad' : w.score < 70 ? 'warn' : 'ok'}>掌握指数 {w.score}</Tag>
+          <>
+            <div className="muted" style={{ marginBottom: 10 }}>
+              排序分两类，互不混排：「待清除」为已练但覆盖率或正确率不足的章节，按掌握指数升序在前；「未覆盖」为尚未开始练习的章节，
+              按未练题量降序补足剩余名额。未覆盖章节没有正确率数据，因此不参与掌握指数比较。
+            </div>
+            <div className="grid grid-2">
+              {diag.weakPoints.map((w, i) => (
+                <div key={w.chapter} className="card card-pad row-between" style={{ boxShadow: 'none' }}>
+                  <div>
+                    <div className="row" style={{ gap: 8 }}>
+                      <b>
+                        {i + 1}. {w.chapter}
+                      </b>
+                      {w.kind === 'weak' ? (
+                        <Tag tone={w.score < 50 ? 'bad' : w.score < 70 ? 'warn' : 'ok'}>掌握指数 {w.score}</Tag>
+                      ) : null}
+                      <Tag tone={KIND_LABEL[w.kind].tone}>{KIND_LABEL[w.kind].text}</Tag>
+                    </div>
+                    <div className="muted-2" style={{ marginTop: 4 }}>
+                      {w.detail}
+                    </div>
                   </div>
-                  <div className="muted-2" style={{ marginTop: 4 }}>
-                    {w.detail}
-                  </div>
+                  <button className="btn btn-sm" onClick={() => nav('practice', { chapter: w.chapter })}>
+                    练习
+                  </button>
                 </div>
-                <button className="btn btn-sm" onClick={() => nav('practice', { chapter: w.chapter })}>
-                  练习
-                </button>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          </>
         )}
       </CardPad>
 
