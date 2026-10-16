@@ -134,6 +134,14 @@ jobs:
           E2E_BASE: http://localhost:5173
           CHROME_PATH: /usr/bin/google-chrome-stable
 
+      # 阶段 2 复习策略的端到端行为验证：状态机恢复、计划配额、诊断分类、
+      # 主观题不显示正确率、到期积压顺延提示。
+      - name: 浏览器 E2E（阶段 2 复习策略行为）
+        run: npm run test:browser:phase2
+        env:
+          E2E_BASE: http://localhost:5173
+          CHROME_PATH: /usr/bin/google-chrome-stable
+
       - name: 失败时上传诊断日志
         if: failure()
         run: |
