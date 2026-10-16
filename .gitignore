@@ -70,6 +70,7 @@ tools/push-via-api.mjs
 tools/ci-logs.mjs
 tools/ci-status.mjs
 tools/create-pr.mjs
+tools/pr-reviews.mjs
 tools/secret-scan.mjs
 tools/verify-remote.mjs
 tools/history-scan.mjs
@@ -83,6 +84,7 @@ tools/verify-sample-originality.mjs
 # ---- commit message scratch ----
 .commitmsg
 .commit-msg.tmp
+commit-msg.tmp
 commit-msg.txt
 
 # ---- Python caches (local parse tooling) ----

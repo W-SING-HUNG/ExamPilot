@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { buildPlan, planPools, orderDueOldestFirst, SUBJECTIVE_SLOTS } from './plan'
-import { freshRecord, mulberry32 } from './scheduler'
+import { freshRecord, applyAttempt, applySubjectiveAttempt, mulberry32 } from './scheduler'
 import { objectiveQuestions, subjectiveQuestions, usingSampleBank } from './bank'
 import type { Question, QRecord } from './types'
 
@@ -321,6 +321,162 @@ describe('plan / small bank', () => {
     })
     expect(objOf(plan.questions)).toHaveLength(3)
     expect(plan.shortfall).toBe(7)
+  })
+
+  it('T7: a duplicated pool never yields duplicate questions', () => {
+    if (objectiveQuestions.length === 0) return
+    const dup = [objectiveQuestions[0], objectiveQuestions[0], objectiveQuestions[0]]
+    const plan = buildPlan({
+      objective: dup,
+      subjective: [],
+      records: new Map(),
+      now: 10 * DAY,
+      size: 3,
+      rng: mulberry32(7),
+    })
+    const ids = objOf(plan.questions).map((q) => q.id)
+    expect(ids).toEqual([objectiveQuestions[0].id])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Defensive boundaries
+// ---------------------------------------------------------------------------
+
+describe('plan / defensive boundaries', () => {
+  it('a non-positive size produces no objective picks and no error', () => {
+    for (const size of [-5, 0]) {
+      const plan = buildPlan({
+        objective: objectiveQuestions,
+        subjective: subjectiveQuestions,
+        records: new Map(),
+        now: 10 * DAY,
+        size,
+        rng: mulberry32(7),
+      })
+      expect(objOf(plan.questions)).toHaveLength(0)
+      // The subjective slot is independent of the objective quota.
+      expect(subjOf(plan.questions)).toHaveLength(SUBJECTIVE_SLOTS)
+    }
+  })
+
+  it('a huge size is capped by the bank and never duplicates', () => {
+    const t0 = Date.now()
+    const plan = buildPlan({
+      objective: objectiveQuestions,
+      subjective: subjectiveQuestions,
+      records: new Map(),
+      now: 10 * DAY,
+      size: 100000,
+      rng: mulberry32(7),
+    })
+    expect(objOf(plan.questions)).toHaveLength(objectiveQuestions.length)
+    expect(Date.now() - t0).toBeLessThan(5000)
+    const ids = plan.questions.map((q) => q.id)
+    expect(new Set(ids).size).toBe(ids.length)
+  })
+
+  it('a fractional size never issues more questions than requested', () => {
+    for (const size of [1.2, 7.5, 10.1, 19.9]) {
+      const plan = buildPlan({
+        objective: objectiveQuestions,
+        subjective: subjectiveQuestions,
+        records: new Map(),
+        now: 10 * DAY,
+        size,
+        rng: mulberry32(7),
+      })
+      expect(objOf(plan.questions).length).toBeLessThanOrEqual(Math.ceil(size))
+      expect(objOf(plan.questions).length).toBeLessThanOrEqual(objectiveQuestions.length)
+      const ids = plan.questions.map((q) => q.id)
+      expect(new Set(ids).size).toBe(ids.length)
+    }
+  })
+
+  it('an empty objective bank yields only the subjective slot', () => {
+    const plan = buildPlan({
+      objective: [],
+      subjective: subjectiveQuestions,
+      records: new Map(),
+      now: 10 * DAY,
+      size: 20,
+      rng: mulberry32(7),
+    })
+    expect(objOf(plan.questions)).toHaveLength(0)
+    expect(plan.shortfall).toBe(20)
+    expect(plan.deferredDue).toBe(0)
+  })
+
+  it('a legacy record with attempts=0 is never treated as due', () => {
+    // Older builds could leave a row with attempts=0 and a past nextReviewAt.
+    // Such a question has never been answered, so it belongs to the fresh pool.
+    const now = 10 * DAY
+    const records = new Map<string, QRecord>()
+    const n = Math.min(5, objectiveQuestions.length)
+    objectiveQuestions.slice(0, n).forEach((q) => {
+      records.set(q.id, { ...freshRecord(q.id, now), attempts: 0, nextReviewAt: now - DAY })
+    })
+    const plan = buildPlan({
+      objective: objectiveQuestions,
+      subjective: subjectiveQuestions,
+      records,
+      now,
+      size: 10,
+      rng: mulberry32(7),
+    })
+    expect(plan.pools.due).toBe(0)
+    expect(plan.pools.wrong).toBe(0)
+    expect(plan.pools.fresh).toBe(objectiveQuestions.length)
+  })
+
+  it('same-day detection uses the local calendar day, not a rolling 24h', () => {
+    // 23:59 yesterday vs 00:01 today must be treated as different days.
+    const yesterday2359 = new Date()
+    yesterday2359.setDate(yesterday2359.getDate() - 1)
+    yesterday2359.setHours(23, 59, 0, 0)
+    const today0001 = new Date()
+    today0001.setHours(0, 1, 0, 0)
+    const now = today0001.getTime() > Date.now() ? Date.now() : today0001.getTime()
+
+    const records = new Map<string, QRecord>()
+    const n = Math.min(2, objectiveQuestions.length)
+    objectiveQuestions.slice(0, n).forEach((q) => {
+      records.set(q.id, {
+        ...freshRecord(q.id, now),
+        attempts: 4,
+        correctCount: 3,
+        wrongCount: 1,
+        lastSeenAt: yesterday2359.getTime(),
+        nextReviewAt: now - DAY,
+      })
+    })
+    const trained = new Set(objectiveQuestions.slice(0, n).map((q) => q.id))
+    // size equals the pool so quota arithmetic cannot truncate the set.
+    const plan = buildPlan({
+      objective: objectiveQuestions,
+      subjective: [],
+      records,
+      now,
+      size: Math.max(n, 2),
+      rng: mulberry32(7),
+    })
+    const servedTrained = objOf(plan.questions).filter((q) => trained.has(q.id)).length
+    // Trained on a different local day: eligible for today, not deprioritised.
+    expect(servedTrained).toBeGreaterThan(0)
+  })
+
+  it('mixing subjective and objective attempts keeps both sets of counters', () => {
+    let r = freshRecord('mix', 0)
+    r = applyAttempt(r, true, 0)
+    r = applyAttempt(r, false, DAY)
+    const before = { c: r.correctCount, w: r.wrongCount, a: r.attempts }
+    r = applySubjectiveAttempt(r, 2 * DAY)
+    expect(r.correctCount).toBe(before.c)
+    expect(r.wrongCount).toBe(before.w)
+    expect(r.attempts).toBe(before.a + 1)
+    // And the objective path resumes on the objective curve, not the subjective cap.
+    r = applyAttempt(r, true, 3 * DAY)
+    expect(r.correctCount).toBe(before.c + 1)
   })
 })
 
