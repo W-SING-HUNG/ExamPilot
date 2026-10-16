@@ -85,6 +85,8 @@ tools/verify-sample-originality.mjs
 .commitmsg
 .commit-msg.tmp
 commit-msg.tmp
+msg1.txt
+msg2.txt
 commit-msg.txt
 
 # ---- Python caches (local parse tooling) ----

@@ -325,3 +325,118 @@ describe('analysis / diagnosis with real attempts', () => {
     expect(d.overall.subjectiveAttempted).toBeGreaterThan(0)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Defensive boundaries for the diagnosis engine
+// ---------------------------------------------------------------------------
+
+describe('analysis / defensive boundaries', () => {
+  const isSubj = (q: Question) => q.type === 'short' || q.type === 'material'
+
+  it('an empty bank yields well-formed, NaN-free output', () => {
+    const d = computeDiagnosis([], new Map())
+    expect(d.chapters).toHaveLength(0)
+    expect(d.types).toHaveLength(5)
+    expect(d.weakPoints).toHaveLength(0)
+    for (const v of [d.overall.coverage, d.overall.correctRate]) {
+      expect(Number.isNaN(v)).toBe(false)
+    }
+    for (const t of d.types) {
+      expect(Number.isNaN(t.coverage)).toBe(false)
+      expect(Number.isNaN(t.correctRate)).toBe(false)
+    }
+  })
+
+  it('a chapter with no objective questions never divides by zero', () => {
+    const subj = allQuestions.filter(isSubj).slice(0, Math.min(5, allQuestions.filter(isSubj).length))
+    if (subj.length === 0) return
+    const d = computeDiagnosis(subj, new Map())
+    for (const c of d.chapters) {
+      expect(Number.isNaN(c.coverage)).toBe(false)
+      expect(c.coverage).toBe(0)
+      expect(c.total).toBe(c.subjectiveTotal)
+      expect(c.objectiveTotal).toBe(0)
+    }
+  })
+
+  it('chapter totals and type totals both account for the whole bank', () => {
+    const d = computeDiagnosis(allQuestions, new Map())
+    expect(d.types.reduce((s, t) => s + t.total, 0)).toBe(allQuestions.length)
+    expect(d.chapters.reduce((s, c) => s + c.total, 0)).toBe(allQuestions.length)
+    expect(d.overall.total).toBe(objectiveQuestions.length)
+  })
+
+  it('a consolidated chapter is not surfaced even when it still has struggling questions', () => {
+    const ch0 = allQuestions.find((q) => !isSubj(q))!.chapter
+    const qs = allQuestions.filter((q) => q.chapter === ch0 && !isSubj(q))
+    if (qs.length < 10) return
+    const now = Date.now()
+    const recs = new Map<string, QRecord>()
+    qs.forEach((q, i) => {
+      // ~10% of questions genuinely struggle (3 errors, ending on a wrong
+      // answer), while the chapter rate stays comfortably above 80%.
+      const struggling = i % 10 === 0
+      let r = freshRecord(q.id, now)
+      if (struggling) {
+        r = applyAttempt(r, false, now)
+        r = applyAttempt(r, false, now + 1000)
+        r = applyAttempt(r, false, now + 2000)
+      }
+      for (let k = 0; k < 12; k++) r = applyAttempt(r, true, now + 3000 + k * 1000)
+      if (struggling) r = applyAttempt(r, false, now + 20000)
+      recs.set(q.id, r)
+    })
+    const d = computeDiagnosis(allQuestions, recs)
+    const stat = d.chapters.find((c) => c.chapter === ch0)!
+    expect(stat.struggling).toBeGreaterThan(0)
+    expect(stat.coverage).toBe(1)
+    expect(stat.correctRate).toBeGreaterThanOrEqual(0.8)
+    expect(d.weakPoints.find((w) => w.chapter === ch0)).toBeUndefined()
+  })
+
+  it('the same chapter IS surfaced once its correct rate drops below 80%', () => {
+    const ch0 = allQuestions.find((q) => !isSubj(q))!.chapter
+    const qs = allQuestions.filter((q) => q.chapter === ch0 && !isSubj(q))
+    if (qs.length < 4) return
+    const now = Date.now()
+    const recs = new Map<string, QRecord>()
+    qs.forEach((q, i) => {
+      let r = freshRecord(q.id, now)
+      const wrong = i % 2 === 0
+      for (let k = 0; k < 4; k++) r = applyAttempt(r, !wrong, now + k * 1000)
+      recs.set(q.id, r)
+    })
+    const d = computeDiagnosis(allQuestions, recs)
+    const stat = d.chapters.find((c) => c.chapter === ch0)!
+    expect(stat.correctRate).toBeLessThan(0.8)
+    const wp = d.weakPoints.find((w) => w.chapter === ch0)
+    expect(wp).toBeDefined()
+    expect(wp?.kind).toBe('weak')
+  })
+
+  it('a record for a question that is not in the bank is ignored', () => {
+    const now = Date.now()
+    const recs = new Map<string, QRecord>([
+      ['not-in-bank-xyz', { ...freshRecord('not-in-bank-xyz', now), attempts: 9, correctCount: 9, status: 'mastered' }],
+    ])
+    const d = computeDiagnosis(allQuestions, recs)
+    expect(d.overall.attempted).toBe(0)
+    expect(d.overall.ourMastered).toBe(0)
+  })
+
+  it('the diagnosis is deterministic for identical inputs', () => {
+    const now = Date.now()
+    const recs = new Map<string, QRecord>()
+    objectiveQuestions.slice(0, Math.min(8, objectiveQuestions.length)).forEach((q, i) => {
+      recs.set(q.id, applyAttempt(freshRecord(q.id, now), i % 2 === 0, now))
+    })
+    expect(JSON.stringify(computeDiagnosis(allQuestions, recs))).toBe(
+      JSON.stringify(computeDiagnosis(allQuestions, recs)),
+    )
+  })
+
+  it('the weak list never exceeds the limit', () => {
+    const d = computeDiagnosis(allQuestions, new Map())
+    expect(d.weakPoints.length).toBeLessThanOrEqual(WEAK_POINT_LIMIT)
+  })
+})
