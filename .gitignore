@@ -78,6 +78,11 @@ tools/analyze-originality.mjs
 tools/classify-originality.mjs
 tools/verify-sample-originality.mjs
 
+# ---- commit message scratch ----
+.commitmsg
+.commit-msg.tmp
+commit-msg.txt
+
 # ---- Python caches (local parse tooling) ----
 __pycache__/
 *.pyc

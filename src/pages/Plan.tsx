@@ -84,8 +84,8 @@ function buildPlan(records: Map<string, Rec>, size: number): Question[] {
 export function Plan({ params: _params }: { params: Record<string, string> }) {
   const { records, ready } = useStore()
   const [session, setSession] = useState<Question[] | null>(null)
+  const [sessionId, setSessionId] = useState('')
   const [size, setSize] = useState(20)
-  const sessionId = `s-${Date.now()}`
 
   const diag = useMemo(() => computeDiagnosis(allQuestions, records as never), [records])
   const now = Date.now()
@@ -157,7 +157,13 @@ export function Plan({ params: _params }: { params: Record<string, string> }) {
               {plan.length > 8 && <div className="muted-2">……</div>}
             </div>
             <div className="divider" />
-            <button className="btn btn-primary btn-lg" onClick={() => setSession(plan)}>
+            <button
+              className="btn btn-primary btn-lg"
+              onClick={() => {
+                setSession(plan)
+                setSessionId(`s-${Date.now()}`)
+              }}
+            >
               开始今日复习（{plan.length} 题）
             </button>
           </>
@@ -184,7 +190,10 @@ export function Plan({ params: _params }: { params: Record<string, string> }) {
             mode="plan"
             sessionId={sessionId}
             immediateFeedback
-            onFinish={() => setSession(null)}
+            onFinish={() => {
+              setSession(null)
+              setSessionId('')
+            }}
             finishLabel="完成今日任务"
           />
         </div>

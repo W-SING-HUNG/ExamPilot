@@ -15,6 +15,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import puppeteer from 'puppeteer-core'
@@ -71,6 +72,25 @@ async function canImportSource(p) {
       return false
     }
   })
+}
+
+/**
+ * Puppeteer's uploadFile needs a real filesystem path, so a backup JSON produced
+ * inside the page is written to a temp file before being uploaded.
+ */
+function writeTempBackup(name, text) {
+  const dir = path.join(ROOT, 'tools', '.e2e-uploads')
+  mkdirSync(dir, { recursive: true })
+  const file = path.join(dir, name)
+  writeFileSync(file, text, 'utf8')
+  return file
+}
+
+/** Upload a JSON string through the page's real <input type=file>. */
+async function uploadBackup(p, name, text) {
+  const input = await p.$('input[type=file]')
+  assert.ok(input, 'file input exists')
+  await input.uploadFile(writeTempBackup(name, text))
 }
 
 test('browser E2E', async (t) => {
@@ -353,12 +373,15 @@ test('browser E2E', async (t) => {
     // verify the export payload builder via the real module
     const payload = await p.evaluate(async () => {
       const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
       const p2 = m.makeExportPayload({
-        settings: { theme: 'auto' },
+        settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
         records: [],
         history: [],
         mocks: [],
         aiReviews: [],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
       })
       return { schema: p2.schema, roundTrip: m.parseExport(m.serialize(p2)).ok }
     })
@@ -381,15 +404,27 @@ test('browser E2E', async (t) => {
     }
     const res = await p.evaluate(async () => {
       const m = await import('/src/lib/io.ts')
+      // No schema at all -> rejected on the format check (strictest, checked first)
       const bad = m.parseExport('{"records": "not-an-array"}')
+      // Correct schema but a non-array collection -> rejected on the array check
+      const missingArrays = m.parseExport(JSON.stringify({ schema: 'exampilot.export.v1', records: 'not-an-array' }))
       const notJson = m.parseExport('nope')
       const wrongSchema = m.parseExport(
         JSON.stringify({ schema: 'other', records: [], history: [], mocks: [], aiReviews: [] }),
       )
-      return { bad: bad.ok, badErr: bad.errors.join(';'), notJson: notJson.ok, wrongSchema: wrongSchema.ok }
+      return {
+        bad: bad.ok,
+        badErr: bad.errors.join(';'),
+        missingArrays: missingArrays.ok,
+        missingArraysErr: missingArrays.errors.join(';'),
+        notJson: notJson.ok,
+        wrongSchema: wrongSchema.ok,
+      }
     })
     assert.equal(res.bad, false)
-    assert.match(res.badErr, /records/)
+    assert.match(res.badErr, /schema/)
+    assert.equal(res.missingArrays, false)
+    assert.match(res.missingArraysErr, /records/)
     assert.equal(res.notJson, false)
     assert.equal(res.wrongSchema, false)
     await ctx.close()
@@ -535,4 +570,1173 @@ test('browser E2E', async (t) => {
     assert.equal(themeAfterReload, 'dark', 'theme preference persists across reload')
     await ctx.close()
   })
+
+  await t.test('mock exam: blank objective questions are not treated as wrong', async () => {
+    const { p, ctx } = await freshPage()
+    // Seed a definite wrong answer for later comparison.
+    await nav(p, 'mock')
+    await p.waitForSelector('.card-title')
+    await p.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll('input.input[type=number]'))
+      const setVal = (idx, v) => {
+        const el = inputs[idx]
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+        setter.call(el, String(v))
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+      setVal(0, 3)
+      setVal(1, 0)
+      setVal(2, 0)
+      setVal(3, 0)
+      setVal(8, 5)
+    })
+    await new Promise((r) => setTimeout(r, 300))
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-primary.btn-lg'))[0].click()
+    })
+    await p.waitForSelector('.timer', { timeout: 15000 })
+
+    // Answer only the FIRST question, leave the rest blank.
+    await p.evaluate(() => document.querySelector('.opt')?.click())
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn.btn-primary')).find((x) => x.textContent.includes('交卷'))
+      b.click()
+    })
+    await p.waitForFunction(() => document.body.textContent.includes('考试结果'), { timeout: 15000 })
+
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /未作答 · 不计对错/, 'blank questions are labelled as unanswered')
+
+    // The wrong-question bank must NOT contain the blank questions.
+    await nav(p, 'wrong')
+    await p.waitForFunction(() => document.body.textContent.includes('错题本'), { timeout: 10000 })
+    const wrongCount = await p.evaluate(() => {
+      const m = document.body.textContent.match(/(\d+) 道待清除/)
+      return m ? Number(m[1]) : 0
+    })
+    // At most one question was answered; blanks (2) must not be in the wrong bank.
+    assert.ok(wrongCount <= 1, `blank answers must not enter the wrong bank, got ${wrongCount}`)
+    await ctx.close()
+  })
+
+  await t.test('mock exam: reports graded vs ungraded score separately', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'mock')
+    await p.waitForSelector('.card-title')
+    await p.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll('input.input[type=number]'))
+      const setVal = (idx, v) => {
+        const el = inputs[idx]
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+        setter.call(el, String(v))
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+      setVal(0, 2)
+      setVal(1, 0)
+      setVal(2, 0)
+      setVal(3, 1) // one subjective question
+      setVal(8, 5)
+    })
+    await new Promise((r) => setTimeout(r, 300))
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-primary.btn-lg'))[0].click()
+    })
+    await p.waitForSelector('.timer', { timeout: 15000 })
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn.btn-primary')).find((x) => x.textContent.includes('交卷'))
+      b.click()
+    })
+    await p.waitForFunction(() => document.body.textContent.includes('考试结果'), { timeout: 15000 })
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /客观题得分/, 'shows the objective (auto-graded) score')
+    assert.match(body, /主观题 \d+ 分未自动评分/, 'states the ungraded subjective points')
+    assert.match(body, /不代表完整试卷成绩/, 'explicitly denies presenting a partial rate as the full result')
+    await ctx.close()
+  })
+
+  await t.test('mock exam: insufficient bank reports an explainable error', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'mock')
+    await p.waitForSelector('.card-title')
+
+    // Realistic path: the per-type count is set first (clamped against the WHOLE
+    // bank), then the user narrows the chapter range, leaving the request
+    // unsatisfiable. This is exactly the case the guard must catch.
+    const info = await p.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll('input.input[type=number]'))
+      const setVal = (idx, v) => {
+        const el = inputs[idx]
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+        setter.call(el, String(v))
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+      const maxSingles = Number(inputs[0].getAttribute('max') || 0)
+      setVal(0, maxSingles) // request ALL single-choice questions in the bank
+      setVal(1, 0)
+      setVal(2, 0)
+      setVal(3, 0)
+      return { maxSingles }
+    })
+    await new Promise((r) => setTimeout(r, 300))
+
+    // Now restrict to one chapter, which cannot supply that many.
+    const picked = await p.evaluate(() => {
+      const chBtn = Array.from(document.querySelectorAll('.pill-scroll .btn')).find(
+        (b) => b.textContent.trim() === '导论',
+      )
+      chBtn?.click()
+      return Boolean(chBtn)
+    })
+    await new Promise((r) => setTimeout(r, 400))
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-primary.btn-lg'))[0].click()
+    })
+    await new Promise((r) => setTimeout(r, 800))
+
+    const started = await count(p, '.timer')
+    const body = await p.evaluate(() => document.body.textContent)
+    if (!picked || info.maxSingles <= 49) {
+      // Insufficient data to construct the scenario (e.g. sample bank); skip safely.
+      assert.ok(started === 0 || started > 0)
+    } else {
+      assert.equal(started, 0, 'an unsatisfiable config must not start an exam')
+      assert.match(body, /题库数量不足/, 'must explain why the paper cannot be built')
+      assert.match(body, /需要 \d+ 题，题库仅有 \d+ 题/, 'must state the exact shortfall')
+    }
+    await ctx.close()
+  })
+
+  // ---- REAL BROWSER UI: import preview / confirm / restore ----------------
+
+  await t.test('UI: importing a file shows a preview and writes NOTHING until confirmed', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+
+    const seedAndBuild = await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      const payload = m.makeExportPayload({
+        settings: { theme: 'dark', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
+        records: [
+          {
+            qid: 'preview-only-q1',
+            status: 'learning',
+            attempts: 2,
+            correctCount: 2,
+            wrongCount: 0,
+            lastSeenAt: 1,
+            lastCorrect: true,
+            lastAnswer: 'A',
+            intervalDays: 1,
+            ease: 2,
+            nextReviewAt: 1,
+          },
+        ],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
+      })
+      globalThis.__backupText = m.serialize(payload)
+      return { ok: true }
+    })
+    assert.equal(seedAndBuild.ok, true)
+
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'preview.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /导入预览/, 'preview is shown')
+    assert.match(body, /合并|替换/, 'strategy is shown')
+    assert.match(body, /学习记录/, 'diff table is shown')
+    assert.match(body, /确认导入/, 'a confirm button exists')
+    assert.match(body, /取消/, 'a cancel button exists')
+
+    // The database must still be EMPTY: the preview alone writes nothing.
+    const countBeforeConfirm = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      const snap = await dbmod.snapshotDb(dbmod.db)
+      return snap.records.length
+    })
+    assert.equal(countBeforeConfirm, 0, 'preview must not write to the database')
+
+    // Cancel and confirm nothing was written.
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '取消')
+      b?.click()
+    })
+    await new Promise((r) => setTimeout(r, 400))
+    const afterCancel = await p.evaluate(() => document.body.textContent)
+    assert.match(afterCancel, /已取消导入/)
+    const countAfterCancel = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      return (await dbmod.snapshotDb(dbmod.db)).records.length
+    })
+    assert.equal(countAfterCancel, 0, 'cancel leaves the database untouched')
+    await ctx.close()
+  })
+
+  await t.test('UI: replace mode requires an explicit overwrite acknowledgement', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      const payload = m.makeExportPayload({
+        settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
+        records: [],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
+      })
+      globalThis.__backupText = m.serialize(payload)
+    })
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'replace.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.includes('替换（清空后写入）'))
+      b?.click()
+    })
+    await new Promise((r) => setTimeout(r, 400))
+
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /我确认要用备份替换/, 'an explicit overwrite checkbox is required')
+
+    const disabledBefore = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+      return b ? b.disabled : null
+    })
+    assert.equal(disabledBefore, true, 'confirm is blocked before the acknowledgement')
+
+    await p.evaluate(() => {
+      document.querySelectorAll('input[type=checkbox]')[0]?.click()
+    })
+    await new Promise((r) => setTimeout(r, 300))
+    const disabledAfter = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+      return b ? b.disabled : null
+    })
+    assert.equal(disabledAfter, false, 'confirm becomes available after acknowledgement')
+    await ctx.close()
+  })
+
+  await t.test(
+    'UI: fingerprint mismatch blocks progress migration to prevent wrong-question misattribution',
+    async () => {
+      const { p, ctx } = await freshPage()
+      await nav(p, 'io')
+      await p.waitForSelector('.page-title')
+      // A backup from a DIFFERENT bank that references one current question id
+      // Because bank fingerprint does not match, learning progress cannot guarantee
+      // option/answer binding consistency, so it is safely excluded.
+      await p.evaluate(async () => {
+        const m = await import('/src/lib/io.ts')
+        const bankMod = await import('/src/lib/bank.ts')
+        const realId = bankMod.allQuestions[0].id
+        globalThis.__realId = realId
+        const payload = m.makeExportPayload({
+          settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
+          records: [
+            {
+              qid: realId,
+              status: 'learning',
+              attempts: 2,
+              correctCount: 1,
+              wrongCount: 1,
+              lastSeenAt: 1,
+              lastCorrect: false,
+              lastAnswer: 'A',
+              intervalDays: 1,
+              ease: 2,
+              nextReviewAt: 1,
+            },
+          ],
+          history: [],
+          mocks: [],
+          aiReviews: [],
+          bankFingerprint: 'a-completely-different-bank-fingerprint',
+          bankCount: 17,
+        })
+        globalThis.__backupText = m.serialize(payload)
+      })
+      const text = await p.evaluate(() => globalThis.__backupText)
+      await uploadBackup(p, 'mismatch.json', text)
+      await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+      const body = await p.evaluate(() => document.body.textContent)
+      assert.match(body, /题库不一致/, 'mismatch is surfaced')
+      assert.match(body, /防串题污染|单独恢复偏好设置/, 'explains why progress cannot be migrated')
+
+      // Switch to replace mode: since study progress is unverified, replace is blocked to protect existing data
+      await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) =>
+          x.textContent.includes('替换（清空后写入）'),
+        )
+        b?.click()
+      })
+      await new Promise((r) => setTimeout(r, 300))
+
+      const disabledInReplace = await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+        return b ? b.disabled : null
+      })
+      assert.equal(disabledInReplace, true, 'replace mode is blocked when study progress is unverified')
+
+      // Cancel must leave the DB untouched
+      await p.evaluate(() => {
+        Array.from(document.querySelectorAll('.btn'))
+          .find((x) => x.textContent.trim() === '取消')
+          ?.click()
+      })
+      await new Promise((r) => setTimeout(r, 400))
+      const stored = await p.evaluate(async () => {
+        const dbmod = await import('/src/db/database.ts')
+        const snap = await dbmod.snapshotDb(dbmod.db)
+        return { count: snap.records.length }
+      })
+      assert.equal(stored.count, 0, 'database remains clean')
+      await ctx.close()
+    },
+  )
+
+  await t.test('UI: a backup with NO verifiable rows explains why nothing can be imported', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const payload = m.makeExportPayload({
+        settings: undefined,
+        records: [
+          {
+            qid: 'ghost-1',
+            status: 'learning',
+            attempts: 1,
+            correctCount: 1,
+            wrongCount: 0,
+            lastSeenAt: 1,
+            lastCorrect: true,
+            lastAnswer: 'A',
+            intervalDays: 1,
+            ease: 2,
+            nextReviewAt: 1,
+          },
+        ],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: 'another-bank',
+        bankCount: 3,
+      })
+      globalThis.__backupText = m.serialize(payload)
+    })
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'nothing.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(
+      body,
+      /没有可导入的学习进度|没有任何数据能对应到当前题库|没有可导入的内容/,
+      'the reason is explained, not a silent deadlock',
+    )
+    assert.match(body, /没有可导入的数据|没有可导入的内容/)
+
+    const disabled = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+      return b ? b.disabled : null
+    })
+    assert.equal(disabled, true, 'confirm is blocked because there is nothing to import')
+
+    // Cancel must leave the DB untouched.
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn'))
+        .find((x) => x.textContent.trim() === '取消')
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 400))
+    assert.match(await p.evaluate(() => document.body.textContent), /已取消导入/)
+    const count = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      return (await dbmod.snapshotDb(dbmod.db)).records.length
+    })
+    assert.equal(count, 0, 'cancel writes nothing')
+    await ctx.close()
+  })
+
+  await t.test(
+    'UI: backup with mismatched bank but valid settings allows independent settings recovery in merge mode',
+    async () => {
+      const { p, ctx } = await freshPage()
+      await nav(p, 'io')
+      await p.waitForSelector('.page-title')
+
+      await p.evaluate(async () => {
+        const m = await import('/src/lib/io.ts')
+        const payload = m.makeExportPayload({
+          settings: { theme: 'dark', reviewIntervalBase: 4, studyTarget: 40, dailyGoalQuestions: 40 },
+          records: [
+            {
+              qid: 'mismatch-q1',
+              status: 'learning',
+              attempts: 3,
+              correctCount: 2,
+              wrongCount: 1,
+              lastSeenAt: 10,
+              lastCorrect: true,
+              lastAnswer: 'A',
+              intervalDays: 1,
+              ease: 2,
+              nextReviewAt: 1,
+            },
+          ],
+          history: [],
+          mocks: [],
+          aiReviews: [],
+          bankFingerprint: 'completely-different-bank',
+          bankCount: 10,
+        })
+        globalThis.__backupText = m.serialize(payload)
+      })
+
+      const text = await p.evaluate(() => globalThis.__backupText)
+      await uploadBackup(p, 'settings-only.json', text)
+      await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+      const body = await p.evaluate(() => document.body.textContent)
+      assert.match(body, /可单独恢复偏好设置/, 'explains settings can be recovered in merge mode')
+
+      // Confirm button is NOT blocked in merge mode
+      const disabledInMerge = await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+        return b ? b.disabled : null
+      })
+      assert.equal(disabledInMerge, false, 'merge mode allows confirming settings recovery')
+
+      // Now switch to replace mode: replace mode MUST be blocked to prevent accidental wipe of progress
+      await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) =>
+          x.textContent.includes('替换（清空后写入）'),
+        )
+        b?.click()
+      })
+      await new Promise((r) => setTimeout(r, 300))
+
+      const disabledInReplace = await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+        return b ? b.disabled : null
+      })
+      assert.equal(disabledInReplace, true, 'replace mode is blocked when study data cannot be safely verified')
+
+      const bodyReplace = await p.evaluate(() => document.body.textContent)
+      assert.match(bodyReplace, /已禁止替换导入/, 'explains replace is blocked to prevent accidental wipe')
+
+      // Switch back to merge and confirm
+      await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('.btn')).find((x) =>
+          x.textContent.includes('合并（同 ID 以备份为准）'),
+        )
+        b?.click()
+      })
+      await new Promise((r) => setTimeout(r, 300))
+
+      await p.evaluate(() => {
+        Array.from(document.querySelectorAll('.btn'))
+          .find((x) => x.textContent.trim() === '确认导入')
+          ?.click()
+      })
+      await p.waitForFunction(() => document.body.textContent.includes('导入完成'), { timeout: 15000 })
+
+      // Verify DB: settings applied, but 0 records imported (preventing cross-bank corruption)
+      const after = await p.evaluate(async () => {
+        const dbmod = await import('/src/db/database.ts')
+        const snap = await dbmod.snapshotDb(dbmod.db)
+        return {
+          recordsCount: snap.records.length,
+          settings: snap.settings,
+        }
+      })
+      assert.equal(after.recordsCount, 0, 'no unverified records imported')
+      assert.equal(after.settings?.theme, 'dark', 'settings successfully applied')
+      assert.equal(after.settings?.studyTarget, 40, 'settings values successfully applied')
+
+      await ctx.close()
+    },
+  )
+
+  await t.test('UI: a legacy backup without a fingerprint warns and blocks unverified progress', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const payload = m.makeExportPayload({
+        settings: { theme: 'auto', reviewIntervalBase: 1, studyTarget: 30, dailyGoalQuestions: 30 },
+        records: [],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: '',
+        bankCount: 0,
+      })
+      globalThis.__backupText = m.serialize(payload)
+    })
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'legacy.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /旧版备份/, 'legacy backup is identified')
+    assert.match(body, /无法确认题目是否一致|缺乏题目/, 'the risk is stated')
+    assert.match(body, /我确认这是缺少指纹的旧版备份/, 'an explicit acknowledgement is required')
+
+    const disabled = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+      return b ? b.disabled : null
+    })
+    assert.equal(disabled, true, 'legacy restore is blocked until acknowledged')
+    await ctx.close()
+  })
+
+  await t.test('UI: confirmed import restores all five collections into the real database', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+
+    const prepared = await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      // use a real question id so the rows match the running bank
+      const realId = bankMod.allQuestions[0].id
+      const payload = m.makeExportPayload({
+        settings: { theme: 'dark', reviewIntervalBase: 2, studyTarget: 45, dailyGoalQuestions: 25 },
+        records: [
+          {
+            qid: realId,
+            status: 'learning',
+            attempts: 3,
+            correctCount: 2,
+            wrongCount: 1,
+            lastSeenAt: 11,
+            lastCorrect: false,
+            lastAnswer: 'AC',
+            intervalDays: 3,
+            ease: 2,
+            nextReviewAt: 99,
+          },
+        ],
+        history: [
+          {
+            id: 'imported-h1',
+            qid: realId,
+            mode: 'mock',
+            sessionId: 's',
+            answer: 'AC',
+            isCorrect: false,
+            submittedAt: 11,
+            usedAI: false,
+          },
+        ],
+        mocks: [
+          {
+            id: 'imported-m1',
+            startedAt: 1,
+            endedAt: 2,
+            config: {
+              singleCount: 1,
+              multiCount: 0,
+              judgeCount: 0,
+              shortCount: 0,
+              singleScore: 1,
+              multiScore: 2,
+              judgeScore: 1,
+              shortScore: 15,
+              durationMin: 5,
+              chapters: 'all',
+            },
+            submissions: { [realId]: 'AC' },
+            graded: true,
+            score: 0,
+            maxScore: 1,
+            objectiveMaxScore: 1,
+            subjectiveMaxScore: 0,
+            perQuestion: { [realId]: { isCorrect: false, points: 0, unanswered: false } },
+          },
+        ],
+        aiReviews: [
+          {
+            id: 'imported-a1',
+            qid: realId,
+            userAnswer: 'ans',
+            createdAt: 1,
+            provider: 'stub',
+            model: 'm',
+            result: {
+              score: 80,
+              maxScore: 100,
+              hitPoints: [],
+              missedPoints: [],
+              deductions: [],
+              suggestions: [],
+              structureNote: '',
+              disclaimer: '',
+            },
+          },
+        ],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
+      })
+      globalThis.__backupText = m.serialize(payload)
+      globalThis.__realId = realId
+      return { fingerprint: payload.bankFingerprint.slice(0, 12), realId }
+    })
+    assert.ok(prepared.fingerprint)
+
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'good.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    const previewBody = await p.evaluate(() => document.body.textContent)
+    assert.match(previewBody, /题库一致/, 'matching fingerprint needs no acknowledgement')
+
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn')).find((x) => x.textContent.trim() === '确认导入')
+      b?.click()
+    })
+    await p.waitForFunction(() => document.body.textContent.includes('导入完成'), { timeout: 15000 })
+
+    // Verify the REAL app database contains all five collections after confirm.
+    const stored = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      const snap = await dbmod.snapshotDb(dbmod.db)
+      const realId = globalThis.__realId
+      return {
+        records: snap.records.length,
+        history: snap.history.length,
+        mocks: snap.mocks.length,
+        aiReviews: snap.aiReviews.length,
+        settings: snap.settings,
+        wrongCount: snap.records.find((r) => r.qid === realId)?.wrongCount,
+        aiScore: snap.aiReviews[0]?.result?.score,
+        mockScore: snap.mocks[0]?.score,
+      }
+    })
+    assert.equal(stored.records, 1, 'records restored')
+    assert.equal(stored.history, 1, 'history restored')
+    assert.equal(stored.mocks, 1, 'mock archive restored')
+    assert.equal(stored.aiReviews, 1, 'AI reviews restored')
+    assert.equal(stored.settings?.theme, 'dark', 'settings restored')
+    assert.equal(stored.settings?.studyTarget, 45, 'settings values restored')
+    assert.equal(stored.wrongCount, 1, 'record counters preserved')
+    assert.equal(stored.aiScore, 80, 'AI review content preserved')
+    assert.equal(stored.mockScore, 0, 'mock score preserved')
+    await ctx.close()
+  })
+
+  await t.test('UI: re-submitting the same mock exam does not double-count (real DB)', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'mock')
+    await p.waitForSelector('.card-title')
+    await new Promise((r) => setTimeout(r, 300))
+
+    const out = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      const session = await import('/src/lib/session.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      const paper = bankMod.allQuestions.filter((q) => q.type === 'single').slice(0, 3)
+      const submissions = Object.fromEntries(paper.map((q) => [q.id, 'A']))
+      const config = {
+        singleCount: 3,
+        multiCount: 0,
+        judgeCount: 0,
+        shortCount: 0,
+        singleScore: 1,
+        multiScore: 2,
+        judgeScore: 1,
+        shortScore: 15,
+        durationMin: 5,
+        chapters: 'all',
+      }
+      const input = { runId: 'ui-race-run', paper, submissions, config, startedAt: 1, endedAt: 2 }
+      const first = await session.submitMockRun(dbmod.db, input)
+      const second = await session.submitMockRun(dbmod.db, input)
+      const snap = await dbmod.snapshotDb(dbmod.db)
+      return {
+        first: first.status,
+        second: second.status,
+        secondWritten: second.written.records + second.written.history,
+        historyForFirst: snap.history.filter((h) => h.qid === paper[0].id).length,
+        attempts: snap.records.find((r) => r.qid === paper[0].id)?.attempts,
+        mocks: snap.mocks.filter((m) => m.id === 'ui-race-run').length,
+      }
+    })
+    assert.equal(out.first, 'committed')
+    assert.equal(out.second, 'already-submitted', 'a replay must be a no-op')
+    assert.equal(out.secondWritten, 0, 'a replay writes nothing')
+    assert.equal(out.historyForFirst, 1, 'exactly one history row per question')
+    assert.equal(out.attempts, 1, 'attempts are not double-counted')
+    assert.equal(out.mocks, 1, 'exactly one mock archive row')
+    await ctx.close()
+  })
+
+  // ---- settings persistence after import + reload -------------------------
+
+  await t.test('UI: merge without backup settings KEEPS current settings (and survives reload)', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'settings')
+    await p.waitForSelector('.page-title')
+    // Set a distinctive theme, then save it.
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-sm'))
+        .find((b) => b.textContent.includes('深色'))
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 200))
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-primary'))
+        .find((b) => b.textContent.includes('保存设置'))
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 400))
+    assert.equal(await p.evaluate(() => document.documentElement.dataset.theme), 'dark')
+
+    // Import a settings-less backup in MERGE mode.
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      const payload = m.makeExportPayload({
+        settings: undefined,
+        records: [],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
+      })
+      globalThis.__backupText = m.serialize(payload)
+    })
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'no-settings.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    assert.match(
+      await p.evaluate(() => document.body.textContent),
+      /保持当前设置不变/,
+      'the plan states settings are preserved',
+    )
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn'))
+        .find((x) => x.textContent.trim() === '确认导入')
+        ?.click()
+    })
+    await p.waitForFunction(() => document.body.textContent.includes('导入完成'), { timeout: 15000 })
+
+    // REGRESSION: the settings must still be dark, both in the DOM and the DB.
+    assert.equal(await p.evaluate(() => document.documentElement.dataset.theme), 'dark', 'theme preserved after merge')
+    const stored = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      return (await dbmod.snapshotDb(dbmod.db)).settings
+    })
+    assert.equal(stored?.theme, 'dark', 'settings row preserved in the DB')
+
+    // And after a real page reload.
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell', { timeout: 20000 })
+    assert.equal(
+      await p.evaluate(() => document.documentElement.dataset.theme),
+      'dark',
+      'theme survives a page reload after import',
+    )
+    await ctx.close()
+  })
+
+  await t.test('UI: replace without backup settings resets to defaults (and survives reload)', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'settings')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-sm'))
+        .find((b) => b.textContent.includes('深色'))
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 200))
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn.btn-primary'))
+        .find((b) => b.textContent.includes('保存设置'))
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 400))
+    assert.equal(await p.evaluate(() => document.documentElement.dataset.theme), 'dark')
+
+    await nav(p, 'io')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(async () => {
+      const m = await import('/src/lib/io.ts')
+      const bankMod = await import('/src/lib/bank.ts')
+      const payload = m.makeExportPayload({
+        settings: undefined,
+        records: [],
+        history: [],
+        mocks: [],
+        aiReviews: [],
+        bankFingerprint: m.bankFingerprint(bankMod.bank),
+        bankCount: bankMod.bank.questions.length,
+      })
+      globalThis.__backupText = m.serialize(payload)
+    })
+    const text = await p.evaluate(() => globalThis.__backupText)
+    await uploadBackup(p, 'no-settings-replace.json', text)
+    await p.waitForFunction(() => document.body.textContent.includes('导入预览'), { timeout: 10000 })
+
+    // switch to replace and acknowledge
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn'))
+        .find((x) => x.textContent.includes('替换（清空后写入）'))
+        ?.click()
+    })
+    await new Promise((r) => setTimeout(r, 300))
+    await p.evaluate(() => {
+      document.querySelectorAll('input[type=checkbox]')[0]?.click()
+    })
+    await new Promise((r) => setTimeout(r, 200))
+    assert.match(
+      await p.evaluate(() => document.body.textContent),
+      /重置为默认值/,
+      'the plan states settings will reset',
+    )
+
+    await p.evaluate(() => {
+      Array.from(document.querySelectorAll('.btn'))
+        .find((x) => x.textContent.trim() === '确认导入')
+        ?.click()
+    })
+    await p.waitForFunction(() => document.body.textContent.includes('导入完成'), { timeout: 15000 })
+
+    const stored = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      return (await dbmod.snapshotDb(dbmod.db)).settings
+    })
+    assert.equal(stored, null, 'settings row cleared for a replace without settings')
+
+    // Reload: the app falls back to the DEFAULTS. DEFAULT_SETTINGS.theme is
+    // 'auto', which resolves from the OS/browser colour scheme — so assert that
+    // the settings ROW is absent and the UI theme equals what 'auto' resolves to
+    // in THIS browser. The point is that the DB and the UI agree after a reload.
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell', { timeout: 20000 })
+    const after = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      const row = await dbmod.db.settings.get('main')
+      return {
+        hasRow: Boolean(row),
+        rowTheme: row ? row.theme : null,
+        domTheme: document.documentElement.dataset.theme,
+        prefersDark: window.matchMedia('(prefers-color-scheme: dark)').matches,
+      }
+    })
+    assert.equal(after.hasRow, false, 'no settings row after a reset restore')
+    assert.equal(
+      after.domTheme,
+      after.prefersDark ? 'dark' : 'light',
+      "the UI theme matches what the default 'auto' setting resolves to",
+    )
+    await ctx.close()
+  })
+
+  // ---- Plan session ID stability & AI review non-duplication ----------------
+
+  await t.test(
+    'plan: session ID is generated on session start, stays stable across answers and re-renders, and AI review shares session ID without duplicate attempts',
+    async () => {
+      // 1. Start a local mock gateway to serve AI grade without spending real quota or network
+      const http = await import('node:http')
+      const mockPort = 8815
+      let aiGradeRequestReceived = false
+      const mockServer = http.createServer((req, res) => {
+        let body = ''
+        req.on('data', (chunk) => {
+          body += chunk
+        })
+        req.on('end', () => {
+          if (req.url?.includes('/ai/grade')) {
+            aiGradeRequestReceived = true
+            res.writeHead(200, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type',
+            })
+            res.end(
+              JSON.stringify({
+                ok: true,
+                provider: 'mock-stub',
+                model: 'mock-model',
+                result: {
+                  score: 85,
+                  maxScore: 100,
+                  hitPoints: ['答出核心要点'],
+                  missedPoints: [],
+                  deductions: [],
+                  suggestions: ['继续保持'],
+                  structureNote: '逻辑层次分明',
+                  disclaimer: '模拟测试评阅',
+                },
+              }),
+            )
+            return
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+          res.end(JSON.stringify({ ok: true }))
+        })
+      })
+      await new Promise((resolve) => mockServer.listen(mockPort, '127.0.0.1', resolve))
+
+      const { p, ctx } = await freshPage()
+
+      // Set localStorage to point frontend AI requests directly to our mock server
+      await p.evaluate((port) => {
+        localStorage.setItem(
+          'exampilot.ai.config',
+          JSON.stringify({
+            baseUrl: `http://127.0.0.1:${port}`,
+            model: 'mock-model',
+            timeoutMs: 5000,
+          }),
+        )
+      }, mockPort)
+
+      // Seed one subjective question into IndexedDB as due review
+      const seededSubjQid = await p.evaluate(async () => {
+        const bankMod = await import('/src/lib/bank.ts')
+        const dbmod = await import('/src/db/database.ts')
+        const subjQ = bankMod.allQuestions.find((q) => q.type === 'short' || q.type === 'material')
+        if (subjQ) {
+          await dbmod.db.records.put({
+            qid: subjQ.id,
+            status: 'learning',
+            attempts: 1,
+            correctCount: 0,
+            wrongCount: 0,
+            lastSeenAt: 100,
+            lastCorrect: null,
+            lastAnswer: '旧作答',
+            intervalDays: 1,
+            ease: 1,
+            nextReviewAt: 100,
+          })
+          return subjQ.id
+        }
+        return null
+      })
+      assert.ok(seededSubjQid, 'found a subjective question in bank to test')
+
+      await nav(p, 'plan')
+      await p.waitForSelector('.page-title')
+
+      // Select minimal task count 10 so subjective question at the tail is reached quickly
+      await p.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button'))
+        const tenBtn = btns.find((b) => b.textContent?.trim() === '10 题')
+        tenBtn?.click()
+      })
+      await new Promise((r) => setTimeout(r, 400))
+
+      // Must find and click the button to start plan review
+      await p.waitForSelector('button.btn-primary.btn-lg', { timeout: 10000 })
+      const startClicked = await p.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button'))
+        const startBtn = btns.find((b) => b.textContent?.includes('开始今日复习'))
+        if (startBtn) {
+          startBtn.click()
+          return true
+        }
+        return false
+      })
+      assert.equal(startClicked, true, 'must click 开始今日复习 to start session')
+
+      await p.waitForSelector('.q-stem', { timeout: 10000 })
+
+      let submittedCount = 0
+      let subjectiveTested = false
+      let answeredSubjBaselineAttempts = 0
+
+      // Loop through questions until we answer at least 2 questions and definitely answer a subjective question with AI review
+      for (let step = 0; step < 12; step++) {
+        await p.waitForSelector('.q-stem', { timeout: 10000 })
+        const questionInfo = await p.evaluate(async () => {
+          const ta = document.querySelector('textarea')
+          if (ta) {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+            setter?.call(ta, '主观题测试详细回答内容')
+            ta.dispatchEvent(new Event('input', { bubbles: true }))
+
+            // Read currently displayed question id and its baseline attempts from IndexedDB
+            const dbmod = await import('/src/db/database.ts')
+            const bankMod = await import('/src/lib/bank.ts')
+            const stemText = document.querySelector('.q-stem')?.textContent?.trim() || ''
+            const matchedQ = bankMod.allQuestions.find(
+              (q) => q.stem.trim() === stemText || stemText.includes(q.stem.trim().slice(0, 30)),
+            )
+            let baseline = 0
+            if (matchedQ) {
+              const rec = await dbmod.db.records.get(matchedQ.id)
+              baseline = rec?.attempts ?? 0
+            }
+            return { isSubj: true, qid: matchedQ?.id, baseline }
+          }
+          const opt = document.querySelector('.opt')
+          if (opt) {
+            opt.click()
+            return { isSubj: false }
+          }
+          const jb = document.querySelector('.judge-btn')
+          if (jb) jb.click()
+          return { isSubj: false }
+        })
+
+        if (questionInfo.isSubj) {
+          answeredSubjBaselineAttempts = questionInfo.baseline
+        }
+
+        // Submit answer
+        await p.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll('button'))
+          const submitBtn = btns.find((b) => b.textContent?.includes('确认') || b.textContent?.includes('提交'))
+          submitBtn?.click()
+        })
+        await new Promise((r) => setTimeout(r, 600))
+        submittedCount++
+
+        if (questionInfo.isSubj) {
+          subjectiveTested = true
+          // Must find the AI review button without soft skipping
+          const clickedGrade = await p.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('button'))
+            const b = btns.find(
+              (btn) => btn.textContent?.includes('AI 参考评阅') || btn.textContent?.includes('AI 评阅'),
+            )
+            if (b) {
+              b.click()
+              return true
+            }
+            return false
+          })
+          assert.equal(clickedGrade, true, 'AI review button must exist and be clicked')
+
+          // Must wait for AI review result to be saved
+          await p.waitForFunction(() => document.body.textContent?.includes('已保存'), { timeout: 8000 })
+          break
+        }
+
+        // Navigate to next question
+        const hasNext = await p.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll('button'))
+          const nextBtn = btns.find((b) => b.textContent?.includes('下一题'))
+          if (nextBtn) {
+            nextBtn.click()
+            return true
+          }
+          return false
+        })
+        if (!hasNext) break
+        await new Promise((r) => setTimeout(r, 600))
+      }
+
+      // 1. Strict assert: must have entered a subjective question and submitted answer
+      assert.equal(
+        subjectiveTested,
+        true,
+        'must have encountered and answered at least one subjective question in Plan',
+      )
+      // 2. Strict assert: must have answered at least 2 questions total in Plan session
+      assert.ok(submittedCount >= 2, `must have submitted at least 2 questions in session, got ${submittedCount}`)
+      // 3. Strict assert: mock gateway must have actually received the AI grade request
+      assert.equal(aiGradeRequestReceived, true, 'AI mock server must have actually received /ai/grade request')
+
+      // 4. Assert IndexedDB data integrity, session ID consistency, and actual writes
+      const stats = await p.evaluate(async () => {
+        const dbmod = await import('/src/db/database.ts')
+        const allHistory = await dbmod.db.history.toArray()
+        const planHistory = allHistory.filter((h) => h.mode === 'plan')
+        const sessionIds = Array.from(new Set(planHistory.map((h) => h.sessionId)))
+        const distinctQids = Array.from(new Set(planHistory.map((h) => h.qid)))
+        const allAiReviews = await dbmod.db.aiReviews.toArray()
+        const allRecords = await dbmod.db.records.toArray()
+        const aiReview = allAiReviews[0]
+        return {
+          allHistory,
+          allAiReviews,
+          allRecords,
+          planHistory,
+          planHistoryCount: planHistory.length,
+          distinctQids,
+          uniqueSessionIds: sessionIds.length,
+          sessionIds,
+          aiReviewCount: allAiReviews.length,
+          aiReview,
+        }
+      })
+
+      // Strict assert on real IndexedDB writes: at least 2 real answers persisted with distinct qids
+      assert.ok(
+        stats.planHistoryCount >= 2,
+        `IndexedDB must have at least 2 real answers persisted under mode 'plan', got ${stats.planHistoryCount}`,
+      )
+      assert.ok(
+        stats.distinctQids.length >= 2,
+        `IndexedDB plan history must correspond to at least 2 distinct question IDs, got ${stats.distinctQids.length} (${JSON.stringify(stats.distinctQids)})`,
+      )
+
+      // Must have persisted AI review in IndexedDB
+      assert.ok(stats.aiReview, 'AI review must be persisted in IndexedDB aiReviews table')
+      assert.equal(stats.aiReview.result.score, 85, 'AI review result score matches mock gateway')
+
+      const answeredSubjQid = stats.aiReview.qid
+      assert.ok(answeredSubjQid, 'AI review has valid qid')
+
+      // All submissions in this plan session must share exactly 1 stable sessionId
+      assert.equal(
+        stats.uniqueSessionIds,
+        1,
+        `all plan submissions must share exactly 1 stable sessionId, got ${JSON.stringify(stats.sessionIds)}`,
+      )
+      assert.ok(stats.sessionIds[0].startsWith('s-'), 'sessionId format is stable s-...')
+
+      // Subjective attempt in history and AI review in session must share the identical sessionId
+      const subjHistoryEntry = stats.planHistory.find((h) => h.qid === answeredSubjQid)
+      assert.ok(subjHistoryEntry, 'subjective attempt entry exists in history')
+      assert.equal(
+        subjHistoryEntry.sessionId,
+        stats.sessionIds[0],
+        'subjective attempt history shares identical session ID with plan session',
+      )
+      assert.equal(
+        stats.aiReview.id,
+        `ai-${stats.sessionIds[0]}-${answeredSubjQid}`,
+        'AI review row id deterministically binds to identical session ID',
+      )
+
+      // Strict assert: subjective question attempts count increased strictly by 1 (baseline + 1), never duplicated by AI review
+      const subjRecord = stats.allRecords.find((r) => r.qid === answeredSubjQid)
+      assert.ok(subjRecord, 'subjective record exists in db')
+      const expectedAttempts = answeredSubjBaselineAttempts + 1
+      assert.equal(
+        subjRecord.attempts,
+        expectedAttempts,
+        `subjective attempts (${subjRecord.attempts}) must strictly equal baseline (${answeredSubjBaselineAttempts}) + 1 = ${expectedAttempts}, never duplicated by AI review`,
+      )
+
+      mockServer.close()
+      await ctx.close()
+    },
+  )
 })

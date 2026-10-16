@@ -2,7 +2,16 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 
-const CONFIG_PATH = path.resolve(process.cwd(), 'server', 'ai-config.json')
+/**
+ * Config file location. Overridable with AI_CONFIG_PATH so tests (and multi
+ * instance setups) never touch the real `server/ai-config.json`.
+ */
+const CONFIG_PATH =
+  process.env.AI_CONFIG_PATH && process.env.AI_CONFIG_PATH.length > 0
+    ? path.resolve(process.env.AI_CONFIG_PATH)
+    : path.resolve(process.cwd(), 'server', 'ai-config.json')
+
+export const CONFIG_FILE = CONFIG_PATH
 
 export const DEFAULTS = {
   baseUrl: process.env.AI_BASE_URL || '',

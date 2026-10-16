@@ -147,7 +147,27 @@ export function selectQuestions(params: SelectParams): Question[] {
   return result
 }
 
-/** Build a mock exam paper from config: exact per-type counts. */
+export interface PaperError {
+  ok: false
+  error: string
+  /** which requirement was not satisfiable */
+  missing: { type: Question['type']; requested: number; available: number }[]
+}
+export interface PaperOk {
+  ok: true
+  questions: Question[]
+}
+export type PaperResult = PaperOk | PaperError
+
+/**
+ * Build a mock exam paper from config: exact per-type counts.
+ *
+ * Behaviour contract:
+ *  - Selection is uniformly random per type (no slicing, no repeats).
+ *  - If the bank cannot supply the requested count for a type, the call FAILS
+ *    with an explanatory error. It never silently shrinks the paper, never
+ *    duplicates a question, and never loops forever.
+ */
 export function buildPaper(
   allQuestions: Question[],
   config: {
@@ -158,40 +178,66 @@ export function buildPaper(
     chapters: string[] | 'all'
   },
   rng: () => number = Math.random,
-): Question[] {
+): PaperResult {
   const pool =
     config.chapters === 'all'
       ? allQuestions
       : allQuestions.filter((q) => (config.chapters as string[]).includes(q.chapter))
-  const objective = pool.filter((q) => q.type !== 'short' && q.type !== 'material')
-  const shorts = pool.filter((q) => q.type === 'short' || q.type === 'material')
 
-  const byType = (t: Question['type']) => objective.filter((q) => q.type === t)
+  const byType = (t: Question['type']) => pool.filter((q) => q.type === t)
+  const subjective = pool.filter((q) => q.type === 'short' || q.type === 'material')
+
+  const requests: { type: Question['type']; n: number }[] = [
+    { type: 'single', n: config.singleCount },
+    { type: 'multi', n: config.multiCount },
+    { type: 'judge', n: config.judgeCount },
+    { type: 'short', n: config.shortCount },
+  ]
+
+  // Validate availability BEFORE building anything.
+  const missing: PaperError['missing'] = []
+  for (const r of requests) {
+    if (r.n <= 0) continue
+    const available = r.type === 'short' ? subjective.length : byType(r.type).length
+    if (available < r.n) missing.push({ type: r.type, requested: r.n, available })
+  }
+  if (missing.length > 0) {
+    const detail = missing.map((m) => `${m.type} 需要 ${m.requested} 题，题库仅有 ${m.available} 题`).join('；')
+    return {
+      ok: false,
+      error: `题库数量不足，无法按当前配置组卷：${detail}。请减少对应题型数量或扩大章节范围。`,
+      missing,
+    }
+  }
+
   const pick = (arr: Question[], n: number): Question[] => {
     const copy = arr.slice()
     const res: Question[] = []
-    for (let i = 0; i < n && copy.length > 0; i++) {
+    for (let i = 0; i < n; i++) {
       const idx = Math.floor(rng() * copy.length)
       res.push(copy[idx])
       copy.splice(idx, 1)
     }
     return res
   }
-  const singles = pick(byType('single'), config.singleCount)
-  const multis = pick(byType('multi'), config.multiCount)
-  const judges = pick(byType('judge'), config.judgeCount)
-  let subs: Question[] = []
-  if (config.shortCount > 0) {
-    const enough = shorts.slice(0, Math.max(config.shortCount, shorts.length))
-    let need = config.shortCount - enough.length
-    subs = enough
-    while (need > 0) {
-      subs = subs.concat(pick(byType('short'), 1), pick(byType('material'), 1))
-      need = config.shortCount - subs.length
+
+  // Subjective slot: draw from short + material together so the choice is random.
+  const subs = pick(subjective, config.shortCount)
+
+  const questions = [
+    ...pick(byType('single'), config.singleCount),
+    ...pick(byType('multi'), config.multiCount),
+    ...pick(byType('judge'), config.judgeCount),
+    ...subs,
+  ]
+
+  // Defensive invariant: no duplicates, exact requested total.
+  const seen = new Set<string>()
+  for (const q of questions) {
+    if (seen.has(q.id)) {
+      return { ok: false, error: `组卷内部错误：题目 ${q.id} 重复`, missing: [] }
     }
+    seen.add(q.id)
   }
-  return [...singles, ...multis, ...judges, ...subs].slice(
-    0,
-    config.singleCount + config.multiCount + config.judgeCount + config.shortCount,
-  )
+  return { ok: true, questions }
 }

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { Question } from '../lib/types'
 import { aiAskQuestion, aiGrade } from '../lib/ai'
+import { useStore } from '../store/StoreContext'
 import { Tag } from './ui'
 
 /** AI Q&A for the current question. Objective answers always come from the bank. */
@@ -52,7 +53,16 @@ export function AiQaPanel({ q, userAnswer }: { q: Question; userAnswer: string }
 }
 
 /** AI reference grading for short/material questions. */
-export function AiGradePanel({ q, userAnswer }: { q: Question; userAnswer: string }) {
+export function AiGradePanel({
+  q,
+  userAnswer,
+  sessionId = 'ai-panel',
+}: {
+  q: Question
+  userAnswer: string
+  sessionId?: string
+}) {
+  const { saveAiReviewForQuestion } = useStore()
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<null | {
     score: number
@@ -65,21 +75,39 @@ export function AiGradePanel({ q, userAnswer }: { q: Question; userAnswer: strin
     disclaimer: string
   }>(null)
   const [reason, setReason] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
 
   const grade = async () => {
     setLoading(true)
     setResult(null)
     setReason(null)
-    const r = await aiGrade({
-      qid: q.id,
-      stem: q.stem,
-      userAnswer,
-      chapter: q.chapter,
-      kind: q.type === 'short' ? 'short' : 'material',
-    })
-    setLoading(false)
-    if (r.ok && r.result) setResult(r.result)
-    else setReason(r.reason ?? '未知错误')
+    setSaved(false)
+    try {
+      const r = await aiGrade({
+        qid: q.id,
+        stem: q.stem,
+        userAnswer,
+        chapter: q.chapter,
+        kind: q.type === 'short' ? 'short' : 'material',
+      })
+      if (r.ok && r.result) {
+        setResult(r.result)
+        // Saved in ONE transaction: the review row is keyed by (sessionId, qid),
+        // and the training attempt is only created if this question has not
+        // already been attempted in this session. Repeated reviews therefore
+        // never inflate the attempt count.
+        try {
+          await saveAiReviewForQuestion(q, userAnswer, sessionId, r.provider ?? 'sub2api', r.model ?? '', r.result)
+          setSaved(true)
+        } catch (e) {
+          setReason(`评阅结果已生成，但保存失败：${(e as Error).message}`)
+        }
+      } else {
+        setReason(r.reason ?? '未知错误')
+      }
+    } finally {
+      setLoading(false)
+    }
   }
 
   return (
@@ -107,11 +135,12 @@ export function AiGradePanel({ q, userAnswer }: { q: Question; userAnswer: strin
           <List title="修改建议" items={result.suggestions} tone="accent" />
           {result.structureNote && <div className="explain">结构点评：{result.structureNote}</div>}
           <div className="muted-2">{result.disclaimer}</div>
+          {saved && <div className="muted-2">已保存你的原作答与本次评阅结果。</div>}
         </div>
       )}
       {reason && (
         <div className="muted" style={{ color: 'var(--bad)' }}>
-          AI 不可用：{reason}
+          评阅未完成：{reason}
         </div>
       )}
     </div>

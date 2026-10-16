@@ -56,6 +56,15 @@ export interface MockConfig {
   chapters: string[] | 'all'
 }
 
+/** Per-question grading outcome. `unanswered` is distinct from `wrong`. */
+export interface MockQuestionResult {
+  /** null = not auto-scored (subjective); true/false = objective grading */
+  isCorrect: boolean | null
+  points: number
+  /** true when the user left the question blank (never counted as wrong) */
+  unanswered: boolean
+}
+
 export interface MockRun {
   id: string
   startedAt: number
@@ -65,7 +74,11 @@ export interface MockRun {
   graded: boolean
   score: number | null
   maxScore: number
-  perQuestion: Record<string, { isCorrect: boolean | null; points: number }>
+  /** Points obtainable from auto-graded objective questions only. */
+  objectiveMaxScore: number
+  /** Points reserved for subjective questions, never auto-scored. */
+  subjectiveMaxScore: number
+  perQuestion: Record<string, MockQuestionResult>
 }
 
 export interface AiReview {

@@ -1,8 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store/StoreContext'
 import { allQuestions, chapterOrder, TYPE_LABEL } from '../lib/bank'
 import { buildPaper } from '../lib/scheduler'
-import { scoreAnswer } from '../lib/scoring'
 import { CardPad, PageHead, Tag, Empty, Bar, useToast } from '../components/ui'
 import { QuestionCard } from '../components/QuestionCard'
 import { AiGradePanel } from '../components/AiQaPanel'
@@ -30,7 +29,7 @@ export function MockExam({
   nav: (r: RouteName, p?: Record<string, string>) => void
   params: Record<string, string>
 }) {
-  const { ready, saveMockRun, submitAnswer, saveSubjectiveAttempt } = useStore()
+  const { ready, submitMockRun } = useStore()
   const [config, setConfig] = useState<MockConfig>(DEFAULT_CONFIG)
   const [phase, setPhase] = useState<Phase>('config')
   const [paper, setPaper] = useState<Question[]>([])
@@ -40,6 +39,7 @@ export function MockExam({
   const [now, setNow] = useState(Date.now())
   const [runId, setRunId] = useState('')
   const [result, setResult] = useState<MockRun | null>(null)
+  const [paperError, setPaperError] = useState<string | null>(null)
   const [aiQid, setAiQid] = useState<string | null>(null)
   const { toast, el } = useToast()
   const submitting = useRef(false)
@@ -54,81 +54,64 @@ export function MockExam({
   const mm = Math.floor(remaining / 60000)
   const ss = Math.floor((remaining % 60000) / 1000)
 
-  const maxScore = useMemo(() => {
-    const paperSingles = paper.filter((q) => q.type === 'single').length
-    const paperMultis = paper.filter((q) => q.type === 'multi').length
-    const paperJudges = paper.filter((q) => q.type === 'judge').length
-    const paperShorts = paper.filter((q) => q.type === 'short' || q.type === 'material').length
-    return (
-      paperSingles * config.singleScore +
-      paperMultis * config.multiScore +
-      paperJudges * config.judgeScore +
-      paperShorts * config.shortScore
-    )
-  }, [paper, config])
-
   const start = () => {
-    const p = buildPaper(allQuestions, {
+    const built = buildPaper(allQuestions, {
       singleCount: config.singleCount,
       multiCount: config.multiCount,
       judgeCount: config.judgeCount,
       shortCount: config.shortCount,
       chapters: config.chapters,
     })
-    if (p.length === 0) {
-      toast('组卷失败：题库不足')
+    if (!built.ok) {
+      // Explain exactly why, and never silently shrink the paper.
+      toast(built.error)
+      setPaperError(built.error)
       return
     }
-    setPaper(p)
-    setAnswers(Object.fromEntries(p.map((q) => [q.id, null])))
+    setPaperError(null)
+    setPaper(built.questions)
+    setAnswers(Object.fromEntries(built.questions.map((q) => [q.id, null])))
     setIdx(0)
     setEndsAt(Date.now() + config.durationMin * 60000)
     setNow(Date.now())
-    setRunId(`m-${Date.now()}`)
+    setRunId(`m-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`)
     setPhase('running')
   }
 
-  /** Grade and persist into the SAME shared records/history (single progress system). */
+  /**
+   * Submit the exam.
+   *
+   * The whole submission (learning records + history + mock archive) is applied
+   * by `submitMockRun` inside ONE Dexie transaction, keyed by the stable `runId`:
+   *  - a failure anywhere rolls everything back (no half-persisted exam);
+   *  - re-entry after success is a no-op, so double-clicking 交卷 or a timer/manual
+   *    race cannot double-count attempts, correct counts or the wrong bank;
+   *  - progress is read from the DB inside the transaction, not from this
+   *    component's possibly stale snapshot.
+   */
   const submitAll = async (auto = false) => {
     if (submitting.current) return
+    if (paper.length === 0) return
     submitting.current = true
-    const perQuestion: MockRun['perQuestion'] = {}
-    let score = 0
-    for (const q of paper) {
-      const ans = answers[q.id] ?? null
-      if (q.type === 'short' || q.type === 'material') {
-        perQuestion[q.id] = { isCorrect: null, points: 0 }
-        if (ans) await saveSubjectiveAttempt(q, ans, 'mock', runId, false)
-        continue
-      }
-      const ok = scoreAnswer(q, ans) === true
-      const pts = ok
-        ? q.type === 'multi'
-          ? config.multiScore
-          : q.type === 'judge'
-            ? config.judgeScore
-            : config.singleScore
-        : 0
-      score += pts
-      perQuestion[q.id] = { isCorrect: ok, points: pts }
-      await submitAnswer(q, ans, 'mock', runId)
+    try {
+      const out = await submitMockRun({
+        runId,
+        paper,
+        submissions: answers,
+        config,
+        startedAt: endsAt - config.durationMin * 60000,
+        endedAt: Date.now(),
+      })
+      setResult(out.run)
+      setPhase('done')
+      if (auto) toast('考试时间到，已自动交卷')
+      else if (out.status === 'already-submitted') toast('本场考试已提交，未重复计分')
+    } catch (e) {
+      // Transaction rolled back: the exam stays on screen and can be retried.
+      toast(`交卷失败：${(e as Error).message}。数据未写入，可安全重试。`)
+    } finally {
+      submitting.current = false
     }
-    const run: MockRun = {
-      id: runId,
-      startedAt: endsAt - config.durationMin * 60000,
-      endedAt: Date.now(),
-      config,
-      submissions: answers,
-      graded: true,
-      score,
-      maxScore,
-      perQuestion,
-    }
-    await saveMockRun(run)
-    setResult(run)
-    setPhase('done')
-    submitting.current = false
-    if (auto) toast('考试时间到，已自动交卷')
   }
 
   const submitAllRef = useRef(submitAll)
@@ -143,7 +126,6 @@ export function MockExam({
   const q = paper[idx]
   const answeredCount = Object.values(answers).filter((v) => v).length
   const finalScore = result?.score ?? 0
-  const finalMax = result?.maxScore ?? 1
 
   return (
     <>
@@ -151,6 +133,13 @@ export function MockExam({
         title="全真模拟考试"
         desc="题型、题量、分值与时长均可配置——未获知正式考试要求时，默认值只是模板，不代表真实考纲。成绩与练习共用同一套学习记录。"
       />
+
+      <CardPad style={{ marginBottom: 14 }}>
+        <div className="muted-2">
+          限制说明：考试进行中若刷新页面或关闭标签页，本场考试的作答现场<b>不会保留</b>，需重新开始。
+          交卷写入具有事务性与幂等性：失败会整体回滚，同一场考试重复提交不会重复累计学习数据。
+        </div>
+      </CardPad>
 
       {phase === 'config' && (
         <>
@@ -258,6 +247,11 @@ export function MockExam({
                 开始考试
               </button>
             </div>
+            {paperError && (
+              <div className="result-banner bad" style={{ marginTop: 12 }}>
+                {paperError}
+              </div>
+            )}
           </CardPad>
 
           <CardPad style={{ marginTop: 14 }}>
@@ -340,22 +334,30 @@ export function MockExam({
               <div>
                 <div className="card-title">考试结果</div>
                 <div className="muted">
-                  得分{' '}
+                  客观题得分{' '}
                   <b
                     style={{
                       fontSize: 26,
                       color:
-                        finalScore / finalMax >= 0.8
+                        finalScore / Math.max(1, result.objectiveMaxScore) >= 0.8
                           ? 'var(--ok)'
-                          : finalScore / finalMax >= 0.6
+                          : finalScore / Math.max(1, result.objectiveMaxScore) >= 0.6
                             ? 'var(--warn)'
                             : 'var(--bad)',
                     }}
                   >
                     {finalScore}
                   </b>{' '}
-                  / {result.maxScore} （{Math.round((finalScore / Math.max(1, result.maxScore)) * 100)}%）
+                  / {result.objectiveMaxScore}（已自动评分部分，占{' '}
+                  {Math.round((result.objectiveMaxScore / Math.max(1, result.maxScore)) * 100)}%）
                 </div>
+                {result.subjectiveMaxScore > 0 && (
+                  <div className="muted" style={{ marginTop: 4 }}>
+                    主观题 {result.subjectiveMaxScore} 分未自动评分（题库无标准答案），卷面总分 {result.maxScore}{' '}
+                    分。当前得分率 <b>{Math.round((finalScore / Math.max(1, result.objectiveMaxScore)) * 100)}%</b>{' '}
+                    仅为已判分部分的得分率，不代表完整试卷成绩。
+                  </div>
+                )}
               </div>
               <div className="btn-row">
                 <button
@@ -373,12 +375,18 @@ export function MockExam({
               </div>
             </div>
             <Bar
-              value={finalScore / Math.max(1, result.maxScore)}
-              tone={finalScore / finalMax >= 0.8 ? 'ok' : finalScore / finalMax >= 0.6 ? 'warn' : 'bad'}
+              value={finalScore / Math.max(1, result.objectiveMaxScore)}
+              tone={
+                finalScore / Math.max(1, result.objectiveMaxScore) >= 0.8
+                  ? 'ok'
+                  : finalScore / Math.max(1, result.objectiveMaxScore) >= 0.6
+                    ? 'warn'
+                    : 'bad'
+              }
             />
             <div className="muted-2" style={{ marginTop: 8 }}>
-              客观题由题库答案严格判定；主观题未自动评分（题库无标准答案），可点击题目中的「AI
-              参考评阅」。本次作答已计入同一套学习记录。
+              客观题由题库答案严格判定；未作答不计入对错，也不进入错题本；主观题未自动评分，可点击题目中的「AI
+              参考评阅」。本次已作答内容计入同一套学习记录。
             </div>
           </CardPad>
 
@@ -396,7 +404,13 @@ export function MockExam({
                         第 {i + 1} 题 · {TYPE_LABEL[qq.type]} · {qq.chapter}
                       </span>
                       {isSub ? (
-                        <Tag tone="warn">主观题 · 未自动评分</Tag>
+                        per?.unanswered ? (
+                          <Tag tone="warn">主观题 · 未作答</Tag>
+                        ) : (
+                          <Tag tone="warn">主观题 · 未自动评分</Tag>
+                        )
+                      ) : per?.unanswered ? (
+                        <Tag>未作答 · 不计对错</Tag>
                       ) : per?.isCorrect ? (
                         <Tag tone="ok">正确 +{per.points}</Tag>
                       ) : (
@@ -424,7 +438,7 @@ export function MockExam({
                         >
                           {aiQid === qq.id ? '收起 AI 评阅' : 'AI 参考评阅'}
                         </button>
-                        {aiQid === qq.id && <AiGradePanel q={qq} userAnswer={mine ?? ''} />}
+                        {aiQid === qq.id && <AiGradePanel q={qq} userAnswer={mine ?? ''} sessionId={result.id} />}
                       </>
                     )}
                   </div>
@@ -458,20 +472,22 @@ export function MockExam({
           <tbody>
             {mocks.map((m) => {
               const sc = m.score ?? 0
-              const mx = m.maxScore ?? 1
+              // Legacy runs (pre-0.2.0) have no objectiveMaxScore; fall back to maxScore.
+              const graded = m.objectiveMaxScore ?? m.maxScore ?? 1
               return (
                 <tr key={m.id}>
                   <td className="code">{new Date(m.startedAt).toLocaleString('zh-CN', { hour12: false })}</td>
                   <td>{Object.keys(m.submissions).length}</td>
                   <td>
-                    <b>{sc}</b> / {m.maxScore}
+                    <b>{sc}</b> / {graded}
+                    {m.subjectiveMaxScore ? <span className="muted-2"> +{m.subjectiveMaxScore} 未评分</span> : null}
                   </td>
                   <td>
                     <div className="row" style={{ gap: 8 }}>
                       <div style={{ width: 70 }}>
-                        <Bar value={sc / Math.max(1, mx)} tone="accent" />
+                        <Bar value={sc / Math.max(1, graded)} tone="accent" />
                       </div>
-                      <span>{Math.round((sc / Math.max(1, mx)) * 100)}%</span>
+                      <span>{Math.round((sc / Math.max(1, graded)) * 100)}%</span>
                     </div>
                   </td>
                   <td>{Math.round(((m.endedAt ?? m.startedAt) - m.startedAt) / 60000)} 分钟</td>

@@ -146,7 +146,7 @@ export function QuestionRunner({
 
       {reveal && isSubjective && (
         <div style={{ marginTop: 12 }}>
-          <AiGradePanel q={q} userAnswer={value ?? ''} />
+          <AiGradePanel q={q} userAnswer={value ?? ''} sessionId={sessionId} />
         </div>
       )}
 
