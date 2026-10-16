@@ -1015,4 +1015,93 @@ describe('write-path idempotency and consistency', () => {
       await dbMock.delete()
     }
   })
+
+  it('ACCEPTANCE: lowering reviewIntervalBase is not locked by a persisted ease', async () => {
+    // The setting must take effect in BOTH directions through the real write
+    // path: raise it, train, lower it, train again.
+    await recordAttempt(db, {
+      sessionId: 'ease-up',
+      qid: 'q1',
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 1000,
+      easeFloor: 4,
+    })
+    let r = (await snapshotDb(db)).records.find((x) => x.qid === 'q1')!
+    expect(r.ease).toBe(4)
+    expect(r.intervalDays).toBe(1)
+
+    await recordAttempt(db, {
+      sessionId: 'ease-down',
+      qid: 'q1',
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 1000 + DAY2,
+      easeFloor: 2,
+    })
+    r = (await snapshotDb(db)).records.find((x) => x.qid === 'q1')!
+    expect(r.ease).toBe(2)
+    expect(r.intervalDays).toBe(2) // 1 * 2, NOT 1 * 4
+
+    // Consistent for as long as the setting stays lowered.
+    await recordAttempt(db, {
+      sessionId: 'ease-down-2',
+      qid: 'q1',
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 1000 + 2 * DAY2,
+      easeFloor: 2,
+    })
+    r = (await snapshotDb(db)).records.find((x) => x.qid === 'q1')!
+    expect(r.ease).toBe(2)
+    expect(r.intervalDays).toBe(4)
+  })
+
+  it('ACCEPTANCE: raising reviewIntervalBase also takes effect', async () => {
+    await recordAttempt(db, {
+      sessionId: 'ease-r1',
+      qid: 'q1',
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 1000,
+      easeFloor: 2,
+    })
+    await recordAttempt(db, {
+      sessionId: 'ease-r2',
+      qid: 'q1',
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 1000 + DAY2,
+      easeFloor: 3,
+    })
+    const r = (await snapshotDb(db)).records.find((x) => x.qid === 'q1')!
+    expect(r.ease).toBe(3)
+    expect(r.intervalDays).toBe(3)
+  })
+
+  it('omitting the setting keeps the record own ease (backwards compatible)', async () => {
+    await db.records.put({ ...freshRecord('q1', 1000), intervalDays: 2, ease: 4, attempts: 1 })
+    await recordAttempt(db, {
+      sessionId: 'ease-none',
+      qid: 'q1',
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 1000 + DAY2,
+    })
+    const r = (await snapshotDb(db)).records.find((x) => x.qid === 'q1')!
+    expect(r.ease).toBe(4)
+    expect(r.intervalDays).toBe(8)
+  })
 })

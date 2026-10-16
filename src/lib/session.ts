@@ -3,9 +3,6 @@ import type { AiGradeResult, HistoryEntry, MockConfig, MockRun, QRecord, Questio
 import { gradeMockSubmission } from './mock-grading'
 import { applyAttempt, applySubjectiveAttempt, freshRecord } from './scheduler'
 
-/** Interval floor used when no settings value is supplied. Matches DEFAULT_EASE. */
-const DEFAULT_EASE_FLOOR = 2.0
-
 export interface SubmitMockInput {
   /** Stable id for this exam attempt; re-submitting the same id is a no-op. */
   runId: string
@@ -97,7 +94,10 @@ export async function recordAttempt(
   },
 ): Promise<{ created: boolean }> {
   const now = input.now ?? Date.now()
-  const easeFloor = input.easeFloor ?? DEFAULT_EASE_FLOOR
+  // Pass the setting through verbatim: `undefined` means "no setting supplied",
+  // which lets the scheduler keep the record's own ease. Substituting a default
+  // here would silently override a user's persisted value.
+  const easeFloor = input.easeFloor
   let created = false
 
   await db.transaction('rw', db.records, db.history, async () => {
@@ -144,7 +144,8 @@ export async function recordAttempt(
  */
 export async function submitMockRun(db: ExamPilotDB, input: SubmitMockInput): Promise<SubmitMockResult> {
   const { runId, paper, submissions, config, startedAt, endedAt } = input
-  const easeFloor = input.easeFloor ?? DEFAULT_EASE_FLOOR
+  // `undefined` lets the scheduler keep the record's own ease; see recordAttempt.
+  const easeFloor = input.easeFloor
   const graded = gradeMockSubmission(paper, submissions, config)
 
   const run: MockRun = {

@@ -68,6 +68,41 @@ describe('scheduler / interval', () => {
     const rec = { ...freshRecord('q', 0), intervalDays: 1, ease: 2 }
     expect(applyAttempt(rec, true, 0, 0.5).intervalDays).toBe(2)
   })
+
+  it('lowering the setting is not locked by a previously persisted ease', () => {
+    // Acceptance criterion: the setting must take effect in BOTH directions.
+    // Raise it, train (the record now stores a raised ease), then lower it and
+    // train again — the next interval must follow the lowered setting.
+    let r = freshRecord('q', 0)
+    r = applyAttempt(r, true, 0, 4) // setting = 4
+    expect(r.ease).toBe(4)
+    expect(r.intervalDays).toBe(1)
+
+    r = applyAttempt(r, true, DAY, 2) // setting lowered back to 2
+    expect(r.ease).toBe(2)
+    expect(r.intervalDays).toBe(2) // 1 * 2, NOT 1 * 4
+
+    // And it stays consistent for as long as the setting stays lowered.
+    r = applyAttempt(r, true, 2 * DAY, 2)
+    expect(r.intervalDays).toBe(4)
+  })
+
+  it('raising the setting takes effect on a record trained at a lower ease', () => {
+    let r = freshRecord('q', 0)
+    r = applyAttempt(r, true, 0, 2) // setting = 2
+    expect(r.ease).toBe(2)
+    r = applyAttempt(r, true, DAY, 3) // setting raised to 3
+    expect(r.ease).toBe(3)
+    expect(r.intervalDays).toBe(3) // 1 * 3
+  })
+
+  it('a stored ease is still honoured when no floor is supplied', () => {
+    // Backwards compatibility for callers that do not pass a setting.
+    const rec = { ...freshRecord('q', 0), intervalDays: 2, ease: 4 }
+    const out = applyAttempt(rec, true, 0)
+    expect(out.ease).toBe(4)
+    expect(out.intervalDays).toBe(8)
+  })
 })
 
 describe('scheduler / mastery status', () => {

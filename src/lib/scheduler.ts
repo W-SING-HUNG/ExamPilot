@@ -86,13 +86,21 @@ export function statusAfterAttempt(rec: {
  * so the same question grows its interval identically regardless of whether it
  * was answered in practice, a mock exam, or a review session.
  */
-export function applyAttempt(
-  rec: QRecord,
-  isCorrect: boolean,
-  now = Date.now(),
-  easeFloor: number = DEFAULT_EASE,
-): QRecord {
-  const ease = Math.max(rec.ease, easeFloor, DEFAULT_EASE)
+/**
+ * Advance a record after a graded (objective) attempt.
+ *
+ * `easeFloor` is the user-configured minimum interval multiplier
+ * (`settings.reviewIntervalBase`). It is applied on every write path so the
+ * same question grows its interval identically regardless of whether it was
+ * answered in practice, a mock exam, or a review session.
+ *
+ * The effective ease is `max(easeFloor, DEFAULT_EASE)` — derived from the
+ * CURRENT setting, not from the record. A record's stored `ease` is only used
+ * when no floor is supplied, so lowering the setting always takes effect on the
+ * next answer instead of being locked in by a previously persisted value.
+ */
+export function applyAttempt(rec: QRecord, isCorrect: boolean, now = Date.now(), easeFloor?: number): QRecord {
+  const ease = easeFloor === undefined ? Math.max(rec.ease, DEFAULT_EASE) : Math.max(easeFloor, DEFAULT_EASE)
   const prev = rec.intervalDays
   const { intervalDays } = nextInterval(prev, isCorrect, ease)
   const attempts = rec.attempts + 1
