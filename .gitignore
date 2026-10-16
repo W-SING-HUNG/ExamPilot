@@ -69,6 +69,9 @@ tools/gh-api.mjs
 tools/push-via-api.mjs
 tools/ci-logs.mjs
 tools/ci-status.mjs
+tools/ci-steps.mjs
+tools/ci-runs.mjs
+tools/ci-rerun.mjs
 tools/create-pr.mjs
 tools/pr-reviews.mjs
 tools/secret-scan.mjs
