@@ -29,6 +29,9 @@ const CHROME = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Ap
 let browser
 let page
 
+/** Mock AI gateways started by individual subtests, closed in the outer after. */
+const mockServers = []
+
 async function freshPage() {
   const ctx = await browser.createBrowserContext()
   const p = await ctx.newPage()
@@ -100,6 +103,16 @@ test('browser E2E', async (t) => {
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   })
   t.after(async () => {
+    // Release any mock gateway a subtest started but could not close because it
+    // threw. An open server keeps the event loop alive, which made a failing
+    // assertion hang the whole suite until the CI step timed out.
+    for (const s of mockServers) {
+      try {
+        s.close()
+      } catch {
+        /* already closed */
+      }
+    }
     if (browser) await browser.close()
   })
 
@@ -1499,6 +1512,7 @@ test('browser E2E', async (t) => {
         })
       })
       await new Promise((resolve) => mockServer.listen(mockPort, '127.0.0.1', resolve))
+      mockServers.push(mockServer)
 
       const { p, ctx } = await freshPage()
 
@@ -1945,6 +1959,7 @@ test('browser E2E', async (t) => {
       })
     })
     await new Promise((resolve) => mockServer.listen(mockPort, '127.0.0.1', resolve))
+    mockServers.push(mockServer)
 
     const { p, ctx } = await freshPage()
     await p.evaluate((port) => {
@@ -1974,13 +1989,10 @@ test('browser E2E', async (t) => {
     await p.reload({ waitUntil: 'networkidle2' })
     await p.waitForSelector('.app-shell')
 
-    const before = await p.evaluate(async (id) => {
-      const dbmod = await import('/src/db/database.ts')
-      const r = await dbmod.db.records.get(id)
-      return { attempts: r.attempts, nextReviewAt: r.nextReviewAt, intervalDays: r.intervalDays }
-    }, qid)
-
-    // Open the subjective page and review the same question twice.
+    // Open the subjective page and submit an answer. That submission is a
+    // GENUINE new attempt (its own session id), so it legitimately raises the
+    // count by one. The invariant under test is about what the AI REVIEW does
+    // on top of it, so the baseline is captured right after the submission.
     await nav(p, 'subjective')
     await p.waitForSelector('.page-title')
     await p.evaluate(() => {
@@ -1988,19 +2000,26 @@ test('browser E2E', async (t) => {
       b?.click()
     })
     await p.waitForSelector('textarea.textarea', { timeout: 15000 })
+    await p.evaluate(() => {
+      const ta = document.querySelector('textarea.textarea')
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+      setter?.call(ta, '主观题 E2E 评阅内容')
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn.btn-primary.btn-lg'))
+      b[0]?.click()
+    })
+    await new Promise((r) => setTimeout(r, 800))
 
+    const before = await p.evaluate(async (id) => {
+      const dbmod = await import('/src/db/database.ts')
+      const r = await dbmod.db.records.get(id)
+      return { attempts: r.attempts, nextReviewAt: r.nextReviewAt, intervalDays: r.intervalDays }
+    }, qid)
+
+    // Reviewing the same question repeatedly must not move anything.
     for (let i = 0; i < 2; i++) {
-      await p.evaluate(() => {
-        const ta = document.querySelector('textarea.textarea')
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
-        setter?.call(ta, '主观题 E2E 评阅内容')
-        ta.dispatchEvent(new Event('input', { bubbles: true }))
-      })
-      await p.evaluate(() => {
-        const b = Array.from(document.querySelectorAll('.btn.btn-primary.btn-lg'))
-        b[0]?.click()
-      })
-      await new Promise((r) => setTimeout(r, 800))
       const gradeClicked = await p.evaluate(() => {
         const b = Array.from(document.querySelectorAll('button')).find(
           (x) => x.textContent?.includes('AI 参考评阅') || x.textContent?.includes('AI 评阅'),
@@ -2024,10 +2043,15 @@ test('browser E2E', async (t) => {
 
     // The attempt was already recorded for this session, so re-reviewing must
     // NOT add an attempt and must NOT push the next review date out.
-    assert.equal(after.attempts, before.attempts, 'AI review must not add training attempts')
-    assert.equal(after.nextReviewAt, before.nextReviewAt, 'AI review must not advance the review interval')
-    assert.equal(after.status, 'learning', 'subjective status stays learning, never mastered')
-    mockServer.close()
-    await ctx.close()
+    try {
+      assert.equal(after.attempts, before.attempts, 'AI review must not add training attempts')
+      assert.equal(after.nextReviewAt, before.nextReviewAt, 'AI review must not advance the review interval')
+      assert.equal(after.status, 'learning', 'subjective status stays learning, never mastered')
+    } finally {
+      // Always release the server: a skipped close keeps the event loop alive
+      // and the whole suite hangs until the CI step times out.
+      mockServer.close()
+      await ctx.close()
+    }
   })
 })
