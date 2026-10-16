@@ -103,7 +103,8 @@ describe('T1 / brand-new user', () => {
 describe('T2 / large backlog of untrained questions', () => {
   it('due questions take their share and untrained questions fill the rest', () => {
     const records = new Map<string, QRecord>()
-    const dueCount = Math.min(60, objectiveQuestions.length)
+    // Overdue at least a quarter of the bank, capped so the test stays fast.
+    const dueCount = Math.max(1, Math.min(60, Math.ceil(objectiveQuestions.length / 4)))
     objectiveQuestions.slice(0, dueCount).forEach((q, i) => {
       let r = freshRecord(q.id, NOW - 30 * DAY)
       r = applyAttempt(r, false, NOW - 30 * DAY)
@@ -112,28 +113,38 @@ describe('T2 / large backlog of untrained questions', () => {
       r = applyAttempt(r, true, NOW - (i + 1) * DAY) // due now, recently correct
       records.set(q.id, r)
     })
-    const plan = runPlan({ records, size: 20 })
+    const size = 20
+    const objTarget = Math.min(size, objectiveQuestions.length)
+    const plan = runPlan({ records, size })
     const dueInPlan = objOf(plan.questions).filter((q) => (records.get(q.id)?.nextReviewAt ?? Infinity) <= NOW).length
-    expect(dueInPlan).toBeGreaterThanOrEqual(Math.ceil(20 * 0.5) > dueCount ? dueCount : Math.ceil(20 * 0.5))
-    expect(plan.pools.fresh).toBeGreaterThan(0)
-    expect(objOf(plan.questions)).toHaveLength(Math.min(20, objectiveQuestions.length))
+    expect(dueInPlan).toBeGreaterThanOrEqual(Math.min(dueCount, Math.ceil(objTarget * 0.5)))
+    expect(objOf(plan.questions)).toHaveLength(objTarget)
+    // Whatever capacity the due pool could not fill comes from untrained work.
+    if (dueInPlan < objTarget) expect(plan.pools.fresh).toBeGreaterThan(0)
   })
 
   it('T12: an overflowing due backlog is reported, not silently dropped', () => {
     const records = new Map<string, QRecord>()
-    const dueCount = Math.min(500, objectiveQuestions.length)
-    objectiveQuestions.slice(0, dueCount).forEach((q, i) => {
+    // Overdue the WHOLE bank, so the quota can never hold it all.
+    objectiveQuestions.forEach((q, i) => {
       let r = freshRecord(q.id, NOW - 40 * DAY)
       r = applyAttempt(r, true, NOW - 40 * DAY)
       r = applyAttempt(r, true, NOW - 39 * DAY)
-      // Stagger the due dates so FIFO order is exercised.
       records.set(q.id, { ...r, nextReviewAt: NOW - (i + 1) * DAY })
     })
-    const plan = runPlan({ records, size: 20 })
-    const dueInPlan = objOf(plan.questions).filter((q) => (records.get(q.id)?.nextReviewAt ?? Infinity) <= NOW).length
-    expect(dueInPlan).toBe(10) // 50% of 20
-    expect(plan.deferredDue).toBe(dueCount - 10)
-    expect(plan.pools.due).toBe(dueCount)
+    const size = 20
+    const objTarget = Math.min(size, objectiveQuestions.length)
+    const plan = runPlan({ records, size })
+    const objPicks = objOf(plan.questions)
+    expect(objPicks).toHaveLength(objTarget)
+    const dueInPlan = objPicks.filter((q) => (records.get(q.id)?.nextReviewAt ?? Infinity) <= NOW).length
+    // At least the 50% due quota is filled; leftover capacity flows back to due.
+    expect(dueInPlan).toBeGreaterThanOrEqual(Math.ceil(objTarget * 0.5))
+    expect(dueInPlan).toBeLessThanOrEqual(objTarget)
+    // The remainder is reported, so the page can say so.
+    expect(plan.deferredDue).toBe(objectiveQuestions.length - dueInPlan)
+    expect(plan.pools.due).toBe(objectiveQuestions.length)
+    expect(plan.pools.wrong).toBe(0)
   })
 })
 
@@ -333,7 +344,9 @@ describe('T9 / subjective and objective mixed', () => {
   it('diagnosis reports subjective training without a correct rate', () => {
     if (subjectiveQuestions.length === 0) return
     const records = new Map<string, QRecord>()
-    for (const q of subjectiveQuestions.slice(0, 5)) trainSubjective(q, records, 3)
+    // Train up to 5, or all of them when the bank is smaller.
+    const n = Math.min(5, subjectiveQuestions.length)
+    for (const q of subjectiveQuestions.slice(0, n)) trainSubjective(q, records, 3)
     const d = computeDiagnosis(allQuestions, records)
     for (const t of d.types.filter((x) => x.type === 'short' || x.type === 'material')) {
       expect(t.correct).toBe(0)
@@ -342,7 +355,7 @@ describe('T9 / subjective and objective mixed', () => {
       expect(t.mastered).toBe(0)
       expect(t.struggling).toBe(0)
     }
-    expect(d.overall.subjectiveAttempted).toBe(5)
+    expect(d.overall.subjectiveAttempted).toBe(n)
   })
 
   it('chapter totals account for every question in the bank', () => {

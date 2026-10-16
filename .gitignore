@@ -68,6 +68,8 @@ tools/list-jobs.mjs
 tools/gh-api.mjs
 tools/push-via-api.mjs
 tools/ci-logs.mjs
+tools/ci-status.mjs
+tools/create-pr.mjs
 tools/secret-scan.mjs
 tools/verify-remote.mjs
 tools/history-scan.mjs

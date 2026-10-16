@@ -30,23 +30,33 @@ function mark(
   })
 }
 
+/**
+ * Split a list into three roughly equal thirds.
+ *
+ * Tests must not assume a bank size: CI runs against the public 17-question
+ * sample bank, local runs against the licensed full bank. Everything here is
+ * derived from the installed bank so the same assertions hold on both.
+ */
+function thirds<T>(list: T[]): [T[], T[], T[]] {
+  const n = list.length
+  const a = Math.ceil(n / 3)
+  const b = Math.ceil((n - a) / 2)
+  return [list.slice(0, a), list.slice(a, a + b), list.slice(a + b)]
+}
+
 describe('plan / pools', () => {
   it('splits the bank into due / wrong / fresh, mutually exclusively', () => {
     const now = 10 * DAY
-    const obj = objectiveQuestions.slice(0, 30)
+    const [duePart, wrongPart, freshPart] = thirds(objectiveQuestions)
+    expect(duePart.length + wrongPart.length + freshPart.length).toBe(objectiveQuestions.length)
     const records = new Map<string, QRecord>()
-    mark(records, obj.slice(0, 10), () => ({ attempts: 5, correctCount: 5, nextReviewAt: now - DAY }), now) // due
-    mark(
-      records,
-      obj.slice(10, 20),
-      () => ({ attempts: 5, correctCount: 3, wrongCount: 2, nextReviewAt: now + 5 * DAY }),
-      now,
-    ) // wrong, not due
-    mark(records, obj.slice(20, 30), () => ({ attempts: 0, nextReviewAt: now }), now) // fresh
-    const { due, wrong, fresh } = planPools(obj, records, now)
-    expect(due).toHaveLength(10)
-    expect(wrong).toHaveLength(10)
-    expect(fresh).toHaveLength(10)
+    mark(records, duePart, () => ({ attempts: 5, correctCount: 5, nextReviewAt: now - DAY }), now) // due
+    mark(records, wrongPart, () => ({ attempts: 5, correctCount: 3, wrongCount: 2, nextReviewAt: now + 5 * DAY }), now) // wrong, not due
+    mark(records, freshPart, () => ({ attempts: 0, nextReviewAt: now }), now) // fresh
+    const { due, wrong, fresh } = planPools(objectiveQuestions, records, now)
+    expect(due).toHaveLength(duePart.length)
+    expect(wrong).toHaveLength(wrongPart.length)
+    expect(fresh).toHaveLength(freshPart.length)
     // No question appears twice.
     const ids = [...due, ...wrong, ...fresh].map((q) => q.id)
     expect(new Set(ids).size).toBe(ids.length)
@@ -54,11 +64,11 @@ describe('plan / pools', () => {
 
   it('a due question that was also answered wrong counts as due only', () => {
     const now = 10 * DAY
-    const obj = objectiveQuestions.slice(0, 5)
+    const obj = objectiveQuestions.slice(0, Math.min(5, objectiveQuestions.length))
     const records = new Map<string, QRecord>()
     mark(records, obj, () => ({ attempts: 5, correctCount: 1, wrongCount: 4, nextReviewAt: now - DAY }), now)
     const { due, wrong } = planPools(obj, records, now)
-    expect(due).toHaveLength(5)
+    expect(due).toHaveLength(obj.length)
     expect(wrong).toHaveLength(0)
   })
 
@@ -83,32 +93,38 @@ describe('plan / pools', () => {
 
 describe('plan / quota', () => {
   it('T1: a brand-new user gets exactly the requested objective count', () => {
+    const bank = objectiveQuestions.length
     for (const size of [10, 20, 30, 50]) {
+      const expected = Math.min(size, bank)
       const s = setup({ size })
       const plan = buildPlan({ ...s, rng: mulberry32(7) })
-      expect(objOf(plan.questions)).toHaveLength(size)
-      expect(plan.shortfall).toBe(0)
+      expect(objOf(plan.questions)).toHaveLength(expected)
+      expect(plan.shortfall).toBe(size - expected)
       expect(plan.pools.due).toBe(0)
       expect(plan.pools.wrong).toBe(0)
     }
   })
 
   it('T1: the subjective slot is extra and does not consume the objective quota', () => {
-    const s = setup({ size: 20 })
+    const size = 20
+    const expected = Math.min(size, objectiveQuestions.length)
+    const s = setup({ size })
     const plan = buildPlan({ ...s, rng: mulberry32(7) })
-    expect(objOf(plan.questions)).toHaveLength(20)
+    expect(objOf(plan.questions)).toHaveLength(expected)
     expect(subjOf(plan.questions)).toHaveLength(SUBJECTIVE_SLOTS)
-    expect(plan.questions).toHaveLength(21)
+    expect(plan.questions).toHaveLength(expected + SUBJECTIVE_SLOTS)
   })
 
   it('T2: due questions take up to half the quota and fresh fills the rest', () => {
     const now = 10 * DAY
     const obj = objectiveQuestions
     const records = new Map<string, QRecord>()
-    // 60 overdue struggling questions.
+    // Make at least a quarter of the bank overdue, or all of it if the bank is
+    // smaller than that.
+    const dueCount = Math.max(1, Math.min(obj.length, Math.ceil(obj.length / 4)))
     mark(
       records,
-      obj.slice(0, 60),
+      obj.slice(0, dueCount),
       () => ({
         status: 'struggling',
         attempts: 6,
@@ -119,30 +135,37 @@ describe('plan / quota', () => {
       }),
       now,
     )
+    const size = 20
     const plan = buildPlan({
       objective: obj,
       subjective: subjectiveQuestions,
       records,
       now,
-      size: 20,
+      size,
       rng: mulberry32(7),
     })
+    const objTarget = Math.min(size, obj.length)
     const dueInPlan = objOf(plan.questions).filter((q) => {
       const r = records.get(q.id)
       return !!r && r.attempts > 0 && r.nextReviewAt <= now
     }).length
-    expect(dueInPlan).toBeGreaterThanOrEqual(10) // ceil(20 * 0.5)
-    expect(dueInPlan).toBeLessThanOrEqual(20)
-    expect(plan.pools.fresh).toBeGreaterThan(0)
+    // The due quota is 50% of the objective target, capped by the due pool.
+    const dueQuota = Math.min(dueCount, Math.ceil(objTarget * 0.5))
+    expect(dueInPlan).toBe(dueQuota)
+    expect(dueInPlan).toBeLessThanOrEqual(objTarget)
+    // Whatever is left is filled from the untrained pool.
+    expect(objOf(plan.questions)).toHaveLength(objTarget)
+    if (dueQuota < objTarget) expect(plan.pools.fresh).toBeGreaterThan(0)
   })
 
   it('T12: when due questions overflow the quota they are deferred, not dropped silently', () => {
     const now = 10 * DAY
     const obj = objectiveQuestions
     const records = new Map<string, QRecord>()
+    // Overdue the whole bank: the quota can never hold it all.
     mark(
       records,
-      obj.slice(0, 500),
+      obj,
       (_, i) => ({
         status: 'learning',
         attempts: 4,
@@ -153,23 +176,28 @@ describe('plan / quota', () => {
       }),
       now,
     )
+    const size = 20
+    const objTarget = Math.min(size, obj.length)
     const plan = buildPlan({
       objective: obj,
       subjective: subjectiveQuestions,
       records,
       now,
-      size: 20,
+      size,
       rng: mulberry32(7),
     })
     const objPicks = objOf(plan.questions)
-    // The due quota (50% of 20) is filled by the oldest overdue questions.
-    expect(objPicks).toHaveLength(20)
+    expect(objPicks).toHaveLength(objTarget)
     const dueInPlan = objPicks.filter((q) => (records.get(q.id)?.nextReviewAt ?? Infinity) <= now).length
-    expect(dueInPlan).toBe(10)
+    // At least the 50% due quota is filled, and with no wrong pool to draw from
+    // the leftover capacity flows back to due — so on a small bank it can be all
+    // of them. Either way the plan is never short.
+    expect(dueInPlan).toBeGreaterThanOrEqual(Math.ceil(objTarget * 0.5))
+    expect(dueInPlan).toBeLessThanOrEqual(objTarget)
     // Everything else is reported as deferred, and the page can say so.
-    expect(plan.deferredDue).toBe(500 - 10)
-    expect(plan.pools.due).toBe(500)
-    expect(plan.pools.fresh).toBeGreaterThan(0)
+    expect(plan.deferredDue).toBe(obj.length - dueInPlan)
+    expect(plan.pools.due).toBe(obj.length)
+    expect(plan.pools.wrong).toBe(0)
   })
 
   it('T12: the backlog drains oldest-first', () => {
@@ -231,30 +259,35 @@ describe('plan / quota', () => {
     const now = 10 * DAY
     const obj = objectiveQuestions
     const records = new Map<string, QRecord>()
-    // 100 due, 0 wrong, plenty fresh -> wrong quota flows to due then fresh.
+    // A large due pool and NO wrong pool: the wrong quota must flow to due and
+    // then fresh so the plan is still full.
+    const dueCount = Math.max(4, Math.min(obj.length, Math.ceil(obj.length * 0.2)))
     mark(
       records,
-      obj.slice(0, 100),
+      obj.slice(0, dueCount),
       () => ({
         status: 'learning',
         attempts: 4,
         correctCount: 3,
-        wrongCount: 1,
+        wrongCount: 0,
         lastSeenAt: now - DAY,
         nextReviewAt: now - DAY,
       }),
       now,
     )
+    const size = 30
+    const objTarget = Math.min(size, obj.length)
     const plan = buildPlan({
       objective: obj,
       subjective: subjectiveQuestions,
       records,
       now,
-      size: 30,
+      size,
       rng: mulberry32(7),
     })
-    expect(objOf(plan.questions)).toHaveLength(30)
-    expect(plan.shortfall).toBe(0)
+    expect(objOf(plan.questions)).toHaveLength(objTarget)
+    expect(plan.shortfall).toBe(size - objTarget)
+    expect(plan.pools.wrong).toBe(0)
   })
 })
 
@@ -338,8 +371,9 @@ describe('plan / determinism', () => {
   })
 
   it('T6: a second plan on the same day serves questions not yet trained today', () => {
-    // 20 overdue questions; the first 10 were trained EARLIER TODAY, the other
-    // 10 have not. The second plan must prefer the untrained ones.
+    // Needs at least 20 overdue questions so half can be already-trained-today
+    // and the other half is still available to rotate to.
+    if (objectiveQuestions.length < 20) return
     const now = 10 * DAY
     const startOfToday = new Date(now)
     startOfToday.setHours(0, 0, 0, 0)
@@ -372,7 +406,8 @@ describe('plan / determinism', () => {
     const startOfToday = new Date(now)
     startOfToday.setHours(0, 0, 0, 0)
     const records = new Map<string, QRecord>()
-    objectiveQuestions.slice(0, 10).forEach((q) => {
+    const dueCount = Math.min(10, objectiveQuestions.length)
+    objectiveQuestions.slice(0, dueCount).forEach((q) => {
       records.set(q.id, {
         ...freshRecord(q.id, now),
         status: 'struggling',
@@ -383,15 +418,17 @@ describe('plan / determinism', () => {
         nextReviewAt: now - 60_000,
       })
     })
+    const size = 10
     const plan = buildPlan({
       objective: objectiveQuestions,
       subjective: [],
       records,
       now,
-      size: 10,
+      size,
       rng: mulberry32(7),
     })
-    expect(objOf(plan.questions)).toHaveLength(10)
+    // The plan is as long as the bank allows; it never shrinks to nothing.
+    expect(objOf(plan.questions)).toHaveLength(Math.min(size, objectiveQuestions.length))
   })
 
   it('reports whether the demo or the full bank is in use', () => {
