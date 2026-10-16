@@ -813,3 +813,206 @@ describe('subjective spaced repetition (S1-S8)', () => {
     expect(res.ok).toBe(true)
   })
 })
+
+/**
+ * Idempotency and cross-path consistency of the write layer.
+ *
+ * These lock in the guarantees the review plan requires: attempt identity is
+ * stable per (sessionId, qid), a mock replay moves nothing, an AI review never
+ * advances a review interval, and all three subjective paths agree on the
+ * interval curve.
+ */
+describe('write-path idempotency and consistency', () => {
+  const DAY2 = 86400000
+  const subjQ = mkq('idem-subj', 'short')
+
+  it('objective recordAttempt is idempotent per (sessionId, qid)', async () => {
+    for (let i = 0; i < 4; i++) {
+      await recordAttempt(db, {
+        sessionId: 'idem-s',
+        qid: 'q1',
+        answer: 'A',
+        mode: 'practice',
+        isCorrect: true,
+        usedAI: false,
+        now: 1000 + i * DAY2,
+      })
+    }
+    const snap = await snapshotDb(db)
+    const r = snap.records.find((x) => x.qid === 'q1')!
+    expect(r.attempts).toBe(1)
+    expect(r.intervalDays).toBe(1) // advanced exactly once
+    expect(snap.history.filter((h) => h.qid === 'q1')).toHaveLength(1)
+  })
+
+  it('a different session on the same question creates a new attempt', async () => {
+    await recordAttempt(db, {
+      sessionId: 'idem-s1',
+      qid: 'q1',
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 1000,
+    })
+    await recordAttempt(db, {
+      sessionId: 'idem-s2',
+      qid: 'q1',
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 2000,
+    })
+    const r = (await snapshotDb(db)).records.find((x) => x.qid === 'q1')!
+    expect(r.attempts).toBe(2)
+    expect(r.intervalDays).toBe(2)
+  })
+
+  it('the ease floor is honoured on the recordAttempt path', async () => {
+    await recordAttempt(db, {
+      sessionId: 'idem-f1',
+      qid: 'q1',
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 1000,
+      easeFloor: 4,
+    })
+    let r = (await snapshotDb(db)).records.find((x) => x.qid === 'q1')!
+    expect(r.ease).toBe(4)
+    await recordAttempt(db, {
+      sessionId: 'idem-f2',
+      qid: 'q1',
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 2000,
+      easeFloor: 4,
+    })
+    r = (await snapshotDb(db)).records.find((x) => x.qid === 'q1')!
+    expect(r.intervalDays).toBe(4)
+  })
+
+  it('a mock replay leaves records, history and mocks byte-identical', async () => {
+    const input = {
+      runId: 'idem-run',
+      paper: PAPER,
+      submissions: { q1: 'A', q2: 'A', q3: '简答' } as Record<string, string | null>,
+      config,
+      startedAt: 1000,
+      endedAt: 2000,
+      easeFloor: 2,
+    }
+    const first = await submitMockRun(db, input)
+    const afterFirst = await snapshotDb(db)
+    const second = await submitMockRun(db, input)
+    const afterSecond = await snapshotDb(db)
+
+    expect(first.status).toBe('committed')
+    expect(second.status).toBe('already-submitted')
+    expect(second.written.records).toBe(0)
+    expect(second.written.history).toBe(0)
+    expect(afterSecond.records).toEqual(afterFirst.records)
+    expect(afterSecond.history).toEqual(afterFirst.history)
+    expect(afterSecond.mocks).toEqual(afterFirst.mocks)
+  })
+
+  it('an AI review after a subjective attempt advances nothing', async () => {
+    await recordAttempt(db, {
+      sessionId: 'idem-ai',
+      qid: subjQ.id,
+      answer: '作答',
+      mode: 'subjective',
+      isCorrect: null,
+      usedAI: false,
+      now: 1000,
+    })
+    const before = (await snapshotDb(db)).records.find((x) => x.qid === subjQ.id)!
+
+    for (let i = 0; i < 3; i++) {
+      await saveAiReviewWithAttempt(db, {
+        sessionId: 'idem-ai',
+        qid: subjQ.id,
+        question: subjQ,
+        userAnswer: '作答',
+        provider: 'stub',
+        model: 'm',
+        result: GRADE,
+        now: 5000 + i * 1000,
+      })
+    }
+    const snap = await snapshotDb(db)
+    const after = snap.records.find((x) => x.qid === subjQ.id)!
+    expect(after.attempts).toBe(before.attempts)
+    expect(after.nextReviewAt).toBe(before.nextReviewAt)
+    expect(after.intervalDays).toBe(before.intervalDays)
+    expect(snap.aiReviews).toHaveLength(1) // one row, updated in place
+  })
+
+  it('a graded record keeps its status across recordAttempt, including demotion', async () => {
+    for (const [i, ok] of [true, true, true].entries()) {
+      await recordAttempt(db, {
+        sessionId: `idem-g${i}`,
+        qid: 'q1',
+        answer: 'A',
+        mode: 'practice',
+        isCorrect: ok,
+        usedAI: false,
+        now: 1000 + i * DAY2,
+      })
+    }
+    const before = (await snapshotDb(db)).records.find((x) => x.qid === 'q1')!
+    expect(before.status).toBe('mastered')
+
+    await recordAttempt(db, {
+      sessionId: 'idem-g3',
+      qid: 'q1',
+      answer: 'B',
+      mode: 'practice',
+      isCorrect: false,
+      usedAI: false,
+      now: 4000,
+    })
+    const after = (await snapshotDb(db)).records.find((x) => x.qid === 'q1')!
+    expect(after.status).toBe('learning')
+    expect(after.intervalDays).toBe(0)
+    expect(after.wrongCount).toBe(1)
+  })
+
+  it('recordAttempt and submitMockRun agree on the subjective interval curve', async () => {
+    const dbMock = createDb(`exampilot-idem-mock-${Math.random().toString(36).slice(2, 10)}`)
+    try {
+      // 5 steps through recordAttempt...
+      for (let i = 0; i < 5; i++) {
+        await recordAttempt(db, {
+          sessionId: `idem-curve-a${i}`,
+          qid: subjQ.id,
+          answer: 'x',
+          mode: 'subjective',
+          isCorrect: null,
+          usedAI: false,
+          now: 1000 + i * DAY2,
+        })
+      }
+      // ...and 5 steps through submitMockRun (one attempt per run).
+      for (let i = 0; i < 5; i++) {
+        await submitMockRun(dbMock, {
+          runId: `idem-curve-r${i}`,
+          paper: PAPER,
+          submissions: { q1: null, q2: null, q3: null, q4: 'x' } as Record<string, string | null>,
+          config,
+          startedAt: 0,
+          endedAt: 1000 + i * DAY2,
+        })
+      }
+      const viaRecord = (await snapshotDb(db)).records.find((x) => x.qid === subjQ.id)!
+      const viaMock = (await snapshotDb(dbMock)).records.find((x) => x.qid === 'q4')!
+      expect(viaMock.intervalDays).toBe(viaRecord.intervalDays)
+    } finally {
+      await dbMock.delete()
+    }
+  })
+})

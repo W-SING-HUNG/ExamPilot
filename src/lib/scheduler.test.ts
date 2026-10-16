@@ -351,4 +351,86 @@ describe('scheduler / selection weights', () => {
     const picked = selectQuestions({ pool: [mkq('only-one')], records: new Map(), now, count: 5 })
     expect(picked.length).toBe(1)
   })
+
+  it('a pool of only not-due mastered questions is still served', () => {
+    // The old hard weight cut-off made these pools yield nothing.
+    const now0 = Date.now()
+    const pool = Array.from({ length: 10 }, (_, i) => mkq(`nd${i}`))
+    const records = new Map<string, QRecord>()
+    for (const q of pool) {
+      records.set(q.id, {
+        ...freshRecord(q.id, now0),
+        status: 'mastered',
+        attempts: 5,
+        correctCount: 5,
+        intervalDays: 100,
+        lastSeenAt: now0 - 5 * DAY,
+        nextReviewAt: now0 + 95 * DAY,
+      })
+    }
+    expect(questionWeight(records.get(pool[0].id)!, now0)).toBe(0.3)
+    const picked = selectQuestions({ pool, records, now: now0, count: 5, rng: mulberry32(3) })
+    expect(picked).toHaveLength(5)
+    expect(new Set(picked.map((q) => q.id)).size).toBe(5)
+  })
+
+  it('the recent-answer penalty applies at the 60s boundary but never zeroes a weight', () => {
+    const now0 = Date.now()
+    const justNow = { ...freshRecord('a', now0), attempts: 0, lastSeenAt: now0, nextReviewAt: now0 + DAY }
+    const justInside = { ...freshRecord('b', now0), attempts: 0, lastSeenAt: now0 - 59_999, nextReviewAt: now0 + DAY }
+    const justOutside = { ...freshRecord('c', now0), attempts: 0, lastSeenAt: now0 - 60_001, nextReviewAt: now0 + DAY }
+    expect(questionWeight(justNow, now0)).toBeGreaterThan(0)
+    expect(questionWeight(justInside, now0)).toBeLessThan(questionWeight(justOutside, now0))
+  })
+
+  it('a question due exactly now counts as due', () => {
+    const now0 = Date.now()
+    const rec = {
+      ...freshRecord('d', now0),
+      attempts: 3,
+      correctCount: 3,
+      lastSeenAt: now0 - DAY,
+      nextReviewAt: now0,
+    }
+    expect(questionWeight(rec, now0)).toBe(8)
+  })
+
+  it('a count larger than the pool returns the whole pool without duplicates', () => {
+    const pool = Array.from({ length: 6 }, (_, i) => mkq(`big${i}`))
+    const picked = selectQuestions({ pool, records: new Map(), now, count: 100, rng: mulberry32(4) })
+    expect(picked).toHaveLength(6)
+    expect(new Set(picked.map((q) => q.id)).size).toBe(6)
+  })
+
+  it('a degenerate rng that always returns 0 or 1 still picks valid questions', () => {
+    const pool = Array.from({ length: 5 }, (_, i) => mkq(`dz${i}`))
+    for (const fixed of [0, 1]) {
+      const picked = selectQuestions({ pool, records: new Map(), now, count: 2, rng: () => fixed })
+      expect(picked).toHaveLength(2)
+      expect(new Set(picked.map((q) => q.id)).size).toBe(2)
+    }
+  })
+
+  it('sampling an equal-weight pool spreads across it', () => {
+    // Probabilistic: assert reachability and spread, never exact coverage.
+    const now0 = Date.now()
+    const pool = Array.from({ length: 40 }, (_, i) => mkq(`sp${i}`))
+    const seen = new Set<string>()
+    for (let s = 0; s < 20; s++) {
+      for (const q of selectQuestions({ pool, records: new Map(), now: now0, count: 5, rng: mulberry32(s + 1) })) {
+        seen.add(q.id)
+      }
+    }
+    expect(seen.size).toBeGreaterThan(pool.length * 0.7)
+  })
+
+  it('different seeds produce different orders', () => {
+    const now0 = Date.now()
+    const pool = Array.from({ length: 30 }, (_, i) => mkq(`sd${i}`))
+    const records = new Map<string, QRecord>()
+    for (const q of pool) records.set(q.id, { ...freshRecord(q.id, now0), attempts: 0, nextReviewAt: now0 + DAY })
+    const a = selectQuestions({ pool, records, now: now0, count: 6, rng: mulberry32(1) }).map((q) => q.id)
+    const b = selectQuestions({ pool, records, now: now0, count: 6, rng: mulberry32(2) }).map((q) => q.id)
+    expect(a.join(',')).not.toBe(b.join(','))
+  })
 })
