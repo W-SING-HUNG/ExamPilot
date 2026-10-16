@@ -2,7 +2,18 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import 'fake-indexeddb/auto'
 import { createDb, restoreBackupInto, snapshotDb, DEFAULT_SETTINGS, type ExamPilotDB } from './database'
 import { makeExportPayload, parseExport, serialize, planImport, bankFingerprint } from '../lib/io'
-import type { QRecord, HistoryEntry, MockRun, AiReview, BankData, Question, AppSettings } from '../lib/types'
+import { recordAttempt, submitMockRun, saveAiReviewWithAttempt } from '../lib/session'
+import { bank as installedBank } from '../lib/bank'
+import type {
+  QRecord,
+  HistoryEntry,
+  MockRun,
+  AiReview,
+  BankData,
+  Question,
+  AppSettings,
+  MockConfig,
+} from '../lib/types'
 
 /** Read settings from a SPECIFIC database instance (the app's readSettings targets the singleton). */
 async function readSettingsOf(target: ExamPilotDB): Promise<AppSettings> {
@@ -418,5 +429,303 @@ describe('IndexedDB settings semantics', () => {
     // settings were NOT reset, because the transaction aborted
     expect(after.settings).toEqual(before.settings)
     expect(after.records).toHaveLength(before.records.length)
+  })
+})
+
+/**
+ * Phase-1 guarantees must still hold after the Phase-2 review-strategy changes.
+ *
+ * The task's red lines are explicit: Phase 2 must not break Phase 1's
+ * transactional writes, Session-ID idempotency, or backup/restore. These tests
+ * re-verify each of those against the Phase-2 write paths.
+ */
+describe('phase-1 guarantees after phase 2', () => {
+  const DAY = 86400000
+  const mkq = (id: string, type: Question['type'] = 'single'): Question => ({
+    id,
+    chapter: 'c',
+    chapterIndex: 0,
+    type,
+    bankNo: 1,
+    pageStart: 1,
+    pageEnd: 1,
+    stem: `s-${id}`,
+    options: type === 'single' || type === 'multi' ? ['a', 'b', 'c', 'd'] : [],
+    answer: type === 'judge' ? 'correct' : 'A',
+    answerNorm: type === 'judge' ? true : 'A',
+    hasOfficialAnswer: type !== 'short' && type !== 'material',
+    isFlagged: false,
+    flagReason: '',
+  })
+  const cfg: MockConfig = {
+    singleCount: 2,
+    multiCount: 0,
+    judgeCount: 0,
+    shortCount: 1,
+    singleScore: 1,
+    multiScore: 2,
+    judgeScore: 1,
+    shortScore: 15,
+    durationMin: 10,
+    chapters: 'all',
+  }
+  const paper = [mkq('q1'), mkq('q2'), mkq('q3', 'short')]
+  const grade = {
+    score: 80,
+    maxScore: 100,
+    hitPoints: [],
+    missedPoints: [],
+    deductions: [],
+    suggestions: [],
+    structureNote: '',
+    disclaimer: 'd',
+  }
+  const settings: AppSettings = { theme: 'dark', reviewIntervalBase: 3, studyTarget: 40, dailyGoalQuestions: 25 }
+
+  /** Export -> validate -> re-parse into a restorable payload. */
+  function exportAndValidate(snap: Awaited<ReturnType<typeof snapshotDb>>) {
+    const payload = makeExportPayload({
+      settings,
+      records: snap.records,
+      history: snap.history,
+      mocks: snap.mocks,
+      aiReviews: snap.aiReviews,
+      bankFingerprint: bankFingerprint(installedBank),
+      bankCount: installedBank.questions.length,
+    })
+    const text = serialize(payload)
+    expect(parseExport(text).ok).toBe(true)
+    return JSON.parse(text) as {
+      records: QRecord[]
+      history: HistoryEntry[]
+      mocks: MockRun[]
+      aiReviews: AiReview[]
+      settings: AppSettings | null
+    }
+  }
+
+  it('a full export/import round-trip preserves every collection written by phase 2', async () => {
+    await recordAttempt(db, {
+      sessionId: 'a',
+      qid: 'q1',
+      answer: 'A',
+      mode: 'practice',
+      isCorrect: true,
+      usedAI: false,
+      now: 1000,
+      easeFloor: 3,
+    })
+    await recordAttempt(db, {
+      sessionId: 'b',
+      qid: 'q1',
+      answer: 'B',
+      mode: 'practice',
+      isCorrect: false,
+      usedAI: false,
+      now: 2000,
+      easeFloor: 3,
+    })
+    await recordAttempt(db, {
+      sessionId: 'c',
+      qid: 'q3',
+      answer: 'answer-text',
+      mode: 'subjective',
+      isCorrect: null,
+      usedAI: false,
+      now: 3000,
+    })
+    await submitMockRun(db, {
+      runId: 'run-x',
+      paper,
+      submissions: { q1: 'A', q2: null, q3: 'answer-text' },
+      config: cfg,
+      startedAt: 0,
+      endedAt: 4000,
+      easeFloor: 3,
+    })
+    await saveAiReviewWithAttempt(db, {
+      sessionId: 'z',
+      qid: 'q3',
+      question: mkq('q3', 'short'),
+      userAnswer: 'answer-text',
+      provider: 'stub',
+      model: 'm',
+      result: grade,
+      now: 5000,
+    })
+
+    const before = await snapshotDb(db)
+    const restored = exportAndValidate(before)
+
+    const db2 = createDb(`exampilot-p1rt-${Math.random().toString(36).slice(2, 10)}`)
+    try {
+      const counts = await restoreBackupInto(db2, {
+        records: restored.records,
+        history: restored.history,
+        mocks: restored.mocks,
+        aiReviews: restored.aiReviews,
+        settingsAction: 'set',
+        settings: restored.settings,
+      })
+      const after = await snapshotDb(db2)
+      expect(counts.records).toBe(before.records.length)
+      expect(after.records).toEqual(before.records)
+      expect(after.history).toEqual(before.history)
+      expect(after.mocks).toEqual(before.mocks)
+      expect(after.aiReviews).toEqual(before.aiReviews)
+      expect(after.settings?.reviewIntervalBase).toBe(3)
+    } finally {
+      await db2.delete()
+    }
+  })
+
+  it('a mock replay after a restore is still a no-op', async () => {
+    const input = {
+      runId: 'run-rt',
+      paper,
+      submissions: { q1: 'A', q2: 'A', q3: 'answer-text' },
+      config: cfg,
+      startedAt: 0,
+      endedAt: 1000,
+      easeFloor: 3,
+    }
+    await submitMockRun(db, input)
+    const snap = await snapshotDb(db)
+    const restored = exportAndValidate(snap)
+
+    await restoreBackupInto(db, {
+      records: restored.records,
+      history: restored.history,
+      mocks: restored.mocks,
+      aiReviews: [],
+      settingsAction: 'set',
+      settings: restored.settings,
+    })
+    const second = await submitMockRun(db, input)
+    expect(second.status).toBe('already-submitted')
+    expect(second.written.records).toBe(0)
+    expect(second.written.history).toBe(0)
+  })
+
+  it('a subjective answer plus repeated AI reviews still yields exactly one attempt', async () => {
+    await recordAttempt(db, {
+      sessionId: 'mix',
+      qid: 'q3',
+      answer: 'a',
+      mode: 'subjective',
+      isCorrect: null,
+      usedAI: false,
+      now: 1000,
+    })
+    for (let i = 0; i < 5; i++) {
+      await saveAiReviewWithAttempt(db, {
+        sessionId: 'mix',
+        qid: 'q3',
+        question: mkq('q3', 'short'),
+        userAnswer: 'a',
+        provider: 'stub',
+        model: 'm',
+        result: grade,
+        now: 2000 + i * 100,
+      })
+    }
+    const snap = await snapshotDb(db)
+    expect(snap.records.find((x) => x.qid === 'q3')?.attempts).toBe(1)
+    expect(snap.history.filter((h) => h.qid === 'q3')).toHaveLength(1)
+    expect(snap.aiReviews).toHaveLength(1)
+  })
+
+  it('a mid-transaction failure still rolls back the whole mock submission', async () => {
+    await submitMockRun(db, {
+      runId: 'seed',
+      paper,
+      submissions: { q1: 'A', q2: 'A', q3: 'x' },
+      config: cfg,
+      startedAt: 0,
+      endedAt: 100,
+    })
+    const before = await snapshotDb(db)
+
+    const original = db.history.put.bind(db.history)
+    let calls = 0
+    db.history.put = ((...args: Parameters<typeof db.history.put>) => {
+      calls++
+      if (calls > 1) throw new Error('injected mid-transaction failure')
+      return original(...args)
+    }) as typeof db.history.put
+
+    await expect(
+      submitMockRun(db, {
+        runId: 'run-fail',
+        paper,
+        submissions: { q1: 'A', q2: 'A', q3: 'y' },
+        config: cfg,
+        startedAt: 0,
+        endedAt: 200,
+      }),
+    ).rejects.toThrow(/injected/)
+    db.history.put = original
+
+    const after = await snapshotDb(db)
+    expect(after.records).toEqual(before.records)
+    expect(after.history).toEqual(before.history)
+    expect(after.mocks).toEqual(before.mocks)
+  })
+
+  it('a failing AI review leaves the original attempt and stats unchanged', async () => {
+    await recordAttempt(db, {
+      sessionId: 'e9',
+      qid: 'q3',
+      answer: 'original',
+      mode: 'subjective',
+      isCorrect: null,
+      usedAI: false,
+      now: 1000,
+    })
+    const before = await snapshotDb(db)
+
+    const original = db.aiReviews.put.bind(db.aiReviews)
+    db.aiReviews.put = (() => {
+      throw new Error('injected')
+    }) as typeof db.aiReviews.put
+    await expect(
+      saveAiReviewWithAttempt(db, {
+        sessionId: 'e9',
+        qid: 'q3',
+        question: mkq('q3', 'short'),
+        userAnswer: 'original',
+        provider: 'stub',
+        model: 'm',
+        result: grade,
+        now: 2000,
+      }),
+    ).rejects.toThrow(/injected/)
+    db.aiReviews.put = original
+
+    const after = await snapshotDb(db)
+    expect(after.records).toEqual(before.records)
+    expect(after.history).toEqual(before.history)
+    expect(after.aiReviews).toHaveLength(0)
+  })
+
+  it('subjective records written by phase 2 pass export validation', async () => {
+    for (let i = 0; i < 6; i++) {
+      await recordAttempt(db, {
+        sessionId: `sub-${i}`,
+        qid: 'q3',
+        answer: 'answer-text',
+        mode: 'subjective',
+        isCorrect: null,
+        usedAI: false,
+        now: 1000 + i * DAY,
+      })
+    }
+    const snap = await snapshotDb(db)
+    const restored = exportAndValidate(snap)
+    const r = restored.records.find((x) => x.qid === 'q3')!
+    expect(r.status).toBe('learning')
+    expect(r.correctCount).toBe(0)
+    expect(r.wrongCount).toBe(0)
+    expect(r.lastCorrect).toBe(null)
   })
 })
