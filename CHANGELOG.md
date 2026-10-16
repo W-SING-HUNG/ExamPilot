@@ -48,12 +48,26 @@
 
 ### 测试
 
-- 新增 `src/lib/plan.test.ts`（19 项）：池划分、配额、回填、顺延、小题库、同日去重、确定性。
-- 新增 `src/lib/trajectory.test.ts`（28 项）：T1–T14 合成学习轨迹与不变量，使用固定时钟与固定种子，无 `Math.random`、无墙钟读取。
-- 扩充 `src/lib/scheduler.test.ts`（5 → 26 项）：状态机恢复/降级、主观题间隔、权重排序、空池退化、ease 下限。
-- 扩充 `src/lib/analysis.test.ts`（14 → 28 项）：R1–R9 薄弱点分类回归，含「1 个全错章节 + 8 个未练章节」的挤出场景。
-- 扩充 `src/db/session.test.ts`（21 → 29 项）：S1–S8 主观题三路径间隔与幂等，含 AI 评阅不推进间隔、重放不推进、计数器不清零。
-- 单元测试总数 141 → 231。
+单元测试（本地 1000 题完整题库）：**286 项通过**；公开示例题库下 280 项通过、6 项跳过（`bank.local.test.ts` 为完整题库专属）。基线为 141 项。
+
+| 文件 | 项数 | 覆盖 |
+| --- | --- | --- |
+| `src/lib/plan.test.ts`（新增） | 27 | 池划分、配额与回填、顺延、小题库、同日去重、确定性、防御性边界 |
+| `src/lib/trajectory.test.ts`（新增） | 28 | T1–T14 合成学习轨迹与不变量，固定时钟 + 固定种子，无 `Math.random`、无墙钟读取 |
+| `src/lib/scheduler.test.ts` | 36 | 状态机恢复/降级、主观题间隔、权重排序、空池退化、ease 下限双向生效、选题边界 |
+| `src/lib/analysis.test.ts` | 36 | R1–R9 薄弱点分类回归、章节统计、诊断引擎防御性边界 |
+| `src/db/session.test.ts` | 39 | S1–S8 主观题三路径间隔与幂等、写入层幂等与一致性、ease 双向验收 |
+| `src/db/roundtrip.test.ts` | 15 | 备份往返、恢复回滚、**阶段 1 机制在阶段 2 改动后的回归** |
+| `src/lib/acceptance.test.ts`（新增） | 13 | 阶段 2 验收指标：与 main `2e65a6b` 的计划构建器并排对比，量化选题覆盖、到期命中、重复率、统计一致性、边界行为 |
+
+浏览器 E2E（真实 Chrome + 真实 Vite dev server）：
+
+- `tests/browser.test.mjs`：33 项通过（含阶段 2 新增 E2E-1..5）。
+- `tests/phase2-ui.test.mjs`（新增）：7 项通过，验证 struggling 恢复、计划配额如实、诊断二分类、章节合计守恒、主观题不显示正确率、到期积压顺延。
+- 两套规模无关：公开示例题库（17 题）与本地完整题库（1000 题）下均通过。
+- 已接入 CI 的 `browser-e2e` Job（三个 Job 名称未变），并对每个 E2E 步骤设置 15 分钟超时护栏。
+
+其他门禁：AI 代理契约 19 项通过；公开信息门禁回归 53 项通过；`typecheck` / `lint` / `format:check` / `build` 全部通过。
 
 ### 已知限制
 
