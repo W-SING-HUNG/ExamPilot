@@ -205,7 +205,7 @@ export function mulberry32(seed: number): () => number {
  * priority as any other due question. Only mastered questions that are NOT due
  * are held back.
  */
-const WEIGHT = {
+export const WEIGHT = {
   dueWrong: 12,
   due: 8,
   notDueWrong: 6,
@@ -220,11 +220,33 @@ const RECENT_WINDOW_MS = 60_000
 const RECENT_PENALTY = 0.3
 
 /**
+ * True when a question is due for review.
+ *
+ * Being overdue only means something for a question that has actually been
+ * answered. A never-attempted question is not "due" — it is untouched, and it
+ * carries its own weight. Without the `attempts > 0` guard a never-attempted
+ * question would read as due, because `freshRecord` seeds `nextReviewAt = now`
+ * and a genuinely missing record is materialised that way; the untouched weight
+ * of 4 would then never apply and such questions would silently be treated as
+ * overdue work.
+ */
+export function isDue(rec: QRecord, now: number): boolean {
+  return rec.attempts > 0 && rec.nextReviewAt <= now
+}
+
+/**
  * Weight of a single question. Exported so the plan builder and the tests can
  * reason about the same numbers the selector uses.
+ *
+ * Priority order, exactly as approved:
+ *   overdue wrong (12) > overdue (8) > not-due wrong (6) = overdue mastered (6)
+ *   > untouched (4) > learning not due (2) > mastered not due (0.3)
+ *
+ * Overdue work therefore outranks never-attempted work, while coverage still
+ * outranks material that is neither due nor previously failed.
  */
 export function questionWeight(rec: QRecord, now: number): number {
-  const due = rec.nextReviewAt <= now
+  const due = isDue(rec, now)
   const untouched = rec.attempts === 0
   let w: number
   if (due && rec.wrongCount > 0) w = WEIGHT.dueWrong

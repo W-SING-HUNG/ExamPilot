@@ -74,6 +74,7 @@ tools/ci-runs.mjs
 tools/ci-rerun.mjs
 tools/ci-report.mjs
 tools/create-pr.mjs
+tools/pr-update.mjs
 tools/pr-reviews.mjs
 tools/secret-scan.mjs
 tools/verify-remote.mjs

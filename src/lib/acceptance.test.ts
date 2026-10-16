@@ -9,15 +9,17 @@ import type { Question, QRecord } from './types'
  * Phase-2 acceptance metrics, measured and asserted rather than reported.
  *
  * The task requires a before/after comparison on selection coverage, due-task
- * hit rate, repeat rate, statistical consistency and boundary behaviour. The
- * "before" column is the behaviour on main `2e65a6b`, reproduced here from the
- * rules that were in place; the "after" column is what this branch implements.
- * Both sides run against the SAME installed bank and the SAME seeded PRNG, so
- * the comparison is apples to apples.
+ * hit rate, repeat rate, statistical consistency and boundary behaviour.
  *
- * The bank is whatever is installed (public 17-question sample in CI, licensed
- * 1000-question bank locally); every assertion is expressed relative to the
- * bank size so it holds on both.
+ * The "before" column is `planBefore` below: the main `2e65a6b` plan builder
+ * reproduced with its OWN weight table and weighted-sampling selector (see the
+ * block comment on `baselineWeight`), driven by the same seeded PRNG as the
+ * "after" column. It is the baseline algorithm, not a stand-in for it.
+ *
+ * The "after" column is this branch. Both run against the same installed bank,
+ * so the comparison is apples to apples. Every assertion is expressed relative
+ * to the bank size and therefore holds on both the public 17-question sample
+ * bank and the licensed 1000-question bank.
  */
 
 const DAY = 86400000
@@ -45,15 +47,79 @@ function planAfter(records: Map<string, QRecord>, size: number) {
 }
 
 /**
- * The plan builder as it behaved on main `2e65a6b`:
- *  - due quota capped at 30% of size, wrong at 40%, fresh at 50%
- *  - fresh quota additionally capped at max(4, round(size*0.5))
- *  - due/wrong/fresh pools identical in construction
- *  - one subjective question appended via Math.random (irrelevant to these
- *    metrics, so it is omitted)
+ * The BASELINE plan builder, reproduced faithfully from main `2e65a6b`.
+ *
+ * Source of truth: `git show 2e65a6b:src/lib/plan.ts` (Plan.tsx `buildPlan`) and
+ * `git show 2e65a6b:src/lib/scheduler.ts` (`selectQuestions`). Both the quota
+ * arithmetic AND the weighted-sampling selector are reproduced, including the
+ * old weight table and the old hard cut-off — a `slice(0, n)` stand-in would not
+ * be the same algorithm and would make the comparison meaningless.
+ *
+ * Differences from this branch, deliberately preserved here:
+ *  - due quota 30% / wrong 40% / fresh `max(4, round(size*0.5))`
+ *  - the old weight table (untouched reaches 16.4 and outranks overdue work)
+ *  - `weight > 0.05` hard cut-off (could yield an empty session)
+ *  - no same-day de-duplication at all
+ *  - `Math.random` for the subjective slot (omitted: irrelevant to these metrics)
+ */
+const BASELINE_WEIGHT = {
+  dueBonus: 6,
+  wrongBoost: 4,
+  learningBonus: 2,
+  newBoost: 1.2,
+  masteredMultiplier: 0.15,
+  recentMultiplier: 0.3,
+  untouchedMultiplier: 2,
+}
+
+/** Baseline `questionWeight`: the internal `weight()` closure of `selectQuestions`. */
+function baselineWeight(rec: QRecord, now: number): number {
+  let w = 1
+  if (rec.nextReviewAt <= now) w += BASELINE_WEIGHT.dueBonus
+  if (rec.status === 'struggling' || rec.wrongCount >= 2) w += BASELINE_WEIGHT.wrongBoost
+  else if (rec.status === 'learning') w += BASELINE_WEIGHT.learningBonus
+  if (rec.status === 'new') w += BASELINE_WEIGHT.newBoost
+  if (rec.status === 'mastered') w *= BASELINE_WEIGHT.masteredMultiplier
+  if (rec.lastSeenAt > 0 && now - rec.lastSeenAt < 60_000) w *= BASELINE_WEIGHT.recentMultiplier
+  if (rec.attempts === 0) w *= BASELINE_WEIGHT.untouchedMultiplier
+  return w
+}
+
+/** Baseline `selectQuestions`, verbatim in behaviour including the 0.05 cut-off. */
+function baselineSelect(pool: Question[], records: Map<string, QRecord>, now: number, count: number, rng: () => number) {
+  if (count <= 0 || pool.length === 0) return []
+  const weight = (q: Question) => baselineWeight(records.get(q.id) ?? freshRecord(q.id, now), now)
+  const result: Question[] = []
+  const chosen = new Set<string>()
+  let guard = 0
+  while (result.length < count && guard < 10000) {
+    guard++
+    const candidates = pool.filter((q) => !chosen.has(q.id) && weight(q) > 0.05)
+    if (candidates.length === 0) break
+    const total = candidates.reduce((s, q) => s + weight(q), 1e-9)
+    let r = rng() * total
+    let picked: Question | null = null
+    for (const q of candidates) {
+      r -= weight(q)
+      if (r <= 0) {
+        picked = q
+        break
+      }
+    }
+    if (!picked) picked = candidates[candidates.length - 1]
+    result.push(picked)
+    chosen.add(picked.id)
+  }
+  return result
+}
+
+/**
+ * Baseline `buildPlan`. Uses the SAME seeded PRNG as `planAfter` so the two are
+ * compared on identical random draws.
  */
 function planBefore(records: Map<string, QRecord>, size: number) {
   const now = NOW
+  const rng = mulberry32(SEED)
   const due: Question[] = []
   const wrong: Question[] = []
   const fresh: Question[] = []
@@ -73,13 +139,9 @@ function planBefore(records: Map<string, QRecord>, size: number) {
       }
     }
   }
-  const take = (pool: Question[], n: number) => {
-    // Deterministic stand-in for the old weighted sampling: take the first n.
-    push(pool.slice(0, Math.max(0, n)))
-  }
-  take(due, Math.max(3, Math.round(size * 0.3)))
-  take(wrong, Math.max(3, Math.round(size * 0.4)))
-  take(fresh, Math.max(4, Math.round(size * 0.5)))
+  push(baselineSelect(due, records, now, Math.max(3, Math.round(size * 0.3)), rng))
+  push(baselineSelect(wrong, records, now, Math.max(3, Math.round(size * 0.4)), rng))
+  push(baselineSelect(fresh, records, now, Math.max(4, Math.round(size * 0.5)), rng))
   return picks.slice(0, size)
 }
 

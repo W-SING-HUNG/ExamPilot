@@ -1,5 +1,5 @@
 import type { Question, QRecord } from './types'
-import { selectQuestions, mulberry32 } from './scheduler'
+import { selectQuestions, mulberry32, isDue as isRecordDue } from './scheduler'
 
 /** Extra subjective questions appended to a plan, on top of the objective quota. */
 export const SUBJECTIVE_SLOTS = 1
@@ -32,8 +32,6 @@ export interface PlanResult {
   shortfall: number
 }
 
-const isDue = (r: QRecord | undefined, now: number): boolean => !!r && r.attempts > 0 && r.nextReviewAt <= now
-
 /**
  * Split the objective bank into the three pools the plan draws from.
  *
@@ -41,6 +39,9 @@ const isDue = (r: QRecord | undefined, now: number): boolean => !!r && r.attempt
  *  - `due`    — attempted and overdue now (highest priority)
  *  - `wrong`  — attempted, has a wrong answer, but is NOT due
  *  - `fresh`  — never attempted (no record, or a record with 0 attempts)
+ *
+ * "Due" is delegated to the scheduler's `isDue` so the plan and the selector
+ * can never disagree about what counts as overdue.
  */
 export function planPools(objective: Question[], records: Map<string, QRecord>, now: number) {
   const due: Question[] = []
@@ -50,7 +51,7 @@ export function planPools(objective: Question[], records: Map<string, QRecord>, 
     const r = records.get(q.id)
     if (!r || r.attempts === 0) {
       fresh.push(q)
-    } else if (isDue(r, now)) {
+    } else if (isRecordDue(r, now)) {
       due.push(q)
     } else if (r.wrongCount > 0) {
       wrong.push(q)
@@ -96,18 +97,47 @@ function trainedToday(rec: QRecord | undefined, now: number): boolean {
 }
 
 /**
+ * Seed for one calendar day.
+ *
+ * Used when the caller supplies no PRNG. The plan is then reproducible within a
+ * day (regenerating shows the same tasks) but varies from day to day, instead of
+ * a fixed constant that would serve the same combination indefinitely.
+ */
+function daySeed(now: number): number {
+  const d = new Date(now)
+  return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate()
+}
+
+/** Split a pool into (not trained today, trained today). */
+function splitByToday(
+  pool: Question[],
+  records: Map<string, QRecord>,
+  now: number,
+): { notToday: Question[]; today: Question[] } {
+  const notToday: Question[] = []
+  const today: Question[] = []
+  for (const q of pool) {
+    if (trainedToday(records.get(q.id), now)) today.push(q)
+    else notToday.push(q)
+  }
+  return { notToday, today }
+}
+
+/**
  * Build the daily plan.
  *
  * `size` counts OBJECTIVE questions only. The subjective slot is additional and
  * never takes an objective slot, so the user can always tell the two apart.
  *
  * Quotas: 50% due, 25% wrong, remainder fresh. Unused quota flows back
- * due -> wrong -> fresh, so a category that is exhausted never wastes capacity.
+ * wrong -> due -> fresh, so a category that is exhausted never wastes capacity.
  *
- * Questions already trained today are pushed to the back of their pool, so
- * generating the plan twice in one day does not serve the same set twice. This
- * is a preference, not a hard filter: if a pool has nothing else to offer, its
- * already-trained questions are still used rather than producing an empty plan.
+ * Same-day protection is applied as a PARTITION, not a reordering: each pool is
+ * split into "not trained today" and "trained today", and the quota is filled
+ * from the first group before the second. Reordering alone would be defeated by
+ * the weighted draw, which ranks candidates by record state rather than by list
+ * position. When the first group cannot cover the quota the remainder comes from
+ * the second, so a plan is never empty and never silently short.
  *
  * When the bank cannot supply `size` objective questions the plan is as long as
  * the bank allows — it never pads with duplicates and never borrows from the
@@ -115,31 +145,17 @@ function trainedToday(rec: QRecord | undefined, now: number): boolean {
  */
 export function buildPlan(input: PlanInput): PlanResult {
   const { objective, subjective, records, now, size } = input
-  const rng = input.rng ?? (Math.random as () => number)
+  // No caller-supplied PRNG: derive a per-day seed so the plan is stable within
+  // a day yet varies across days (a fixed constant would repeat forever).
+  const rng = input.rng ?? mulberry32(daySeed(now))
 
-  const { due: duePoolRaw, wrong: wrongPoolRaw, fresh: freshPoolRaw } = planPools(objective, records, now)
-  const pools = { due: duePoolRaw.length, wrong: wrongPoolRaw.length, fresh: freshPoolRaw.length }
-
-  // Prefer questions not yet trained today, without ever emptying a pool. When
-  // EVERY question in the pool was already trained today there is nothing left
-  // to rotate to, so the pool is returned unchanged and the plan repeats — the
-  // caller is expected to surface that (a repeated plan is honest, a fake one
-  // that hides trained questions is not).
-  const preferNotTrainedToday = (list: Question[]) => {
-    const freshFirst = list.filter((q) => !trainedToday(records.get(q.id), now))
-    if (freshFirst.length === 0) return list
-    const later = list.filter((q) => trainedToday(records.get(q.id), now))
-    return [...freshFirst, ...later]
-  }
-  const duePool = preferNotTrainedToday(duePoolRaw)
-  const wrongPool = preferNotTrainedToday(wrongPoolRaw)
-  const freshPool = preferNotTrainedToday(freshPoolRaw)
+  const { due: duePool, wrong: wrongPool, fresh: freshPool } = planPools(objective, records, now)
+  const pools = { due: duePool.length, wrong: wrongPool.length, fresh: freshPool.length }
 
   const objTarget = Math.max(0, Math.min(size, objective.length))
   const shortfall = Math.max(0, size - objTarget)
 
-  // 50% due, 25% wrong, remainder fresh. `MIN_PER_POOL` only applies while the
-  // bank can actually supply it, so a tiny bank is never over-quota'd.
+  // 50% due, 25% wrong, remainder fresh, each capped by what the pool holds.
   let dueQuota = Math.min(duePool.length, Math.ceil(objTarget * DUE_SHARE))
   let wrongQuota = Math.min(wrongPool.length, Math.ceil(objTarget * WRONG_SHARE))
   let freshQuota = Math.min(freshPool.length, Math.max(0, objTarget - dueQuota - wrongQuota))
@@ -173,22 +189,37 @@ export function buildPlan(input: PlanInput): PlanResult {
     }
   }
 
-  // Due questions are taken oldest-first, but questions already trained today go
-  // last so a second plan in one day does not repeat the same work.
-  const notToday = duePool.filter((q) => !trainedToday(records.get(q.id), now))
-  const today = duePool.filter((q) => trainedToday(records.get(q.id), now))
-  const orderedDue = [...orderDueOldestFirst(notToday, records), ...orderDueOldestFirst(today, records)]
-  push(orderedDue.slice(0, dueQuota))
-  const dueTaken = picks.length
-  push(selectQuestions({ pool: wrongPool, records, now, count: wrongQuota, rng: mulberry32(11) }))
-  push(selectQuestions({ pool: freshPool, records, now, count: freshQuota, rng: mulberry32(13) }))
+  // --- due: oldest-first within each half of the same-day partition ---------
+  {
+    const { notToday, today } = splitByToday(duePool, records, now)
+    const ordered = [
+      ...orderDueOldestFirst(notToday, records),
+      ...orderDueOldestFirst(today, records),
+    ]
+    push(ordered.slice(0, dueQuota))
+  }
+
+  // --- wrong / fresh: fill from "not today" first, then fall back -----------
+  const fillPool = (pool: Question[], quota: number) => {
+    if (quota <= 0 || pool.length === 0) return
+    const { notToday, today } = splitByToday(pool, records, now)
+    const fromNotToday = Math.min(quota, notToday.length)
+    push(selectQuestions({ pool: notToday, records, now, count: fromNotToday, rng }))
+    const remaining = quota - Math.min(fromNotToday, notToday.length)
+    if (remaining > 0) push(selectQuestions({ pool: today, records, now, count: remaining, rng }))
+  }
+  fillPool(wrongPool, wrongQuota)
+  fillPool(freshPool, freshQuota)
 
   const objectivePicks = picks.slice(0, objTarget)
-  // Due questions that did not fit today, deferred to the next plan.
-  const deferredDue = Math.max(0, duePool.length - Math.min(dueTaken, objectivePicks.length))
+  // Due questions that did not fit today, deferred to the next plan. Counted
+  // from what actually made it into the plan, so the number can never drift.
+  const dueIds = new Set(duePool.map((q) => q.id))
+  const dueInPlan = objectivePicks.filter((q) => dueIds.has(q.id)).length
+  const deferredDue = Math.max(0, duePool.length - dueInPlan)
 
-  // One extra subjective question, drawn deterministically. Independent of the
-  // objective quota so writing practice is never crowded out.
+  // One extra subjective question, drawn from the same source. Independent of
+  // the objective quota so writing practice is never crowded out.
   let subjectivePicks: Question[] = []
   if (subjective.length > 0) {
     const idx = Math.min(subjective.length - 1, Math.floor(rng() * subjective.length))
