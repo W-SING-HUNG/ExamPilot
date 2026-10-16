@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { buildPlan, planPools } from './plan'
 import { freshRecord, mulberry32, applyAttempt } from './scheduler'
-import { objectiveQuestions } from './bank'
+import { objectiveQuestions, subjectiveQuestions } from './bank'
 import type { Question, QRecord } from './types'
 
 /**
@@ -305,5 +305,65 @@ describe('plan / same-day de-duplication', () => {
     const plan = run(records, 10)
     // Every one was trained today, so the plan falls back to them and stays full.
     expect(objOf(plan.questions)).toHaveLength(10)
+  })
+
+  it('the subjective slot prefers a question that is due for review', () => {
+    // A subjective question that has come due must have a better chance of
+    // reappearing than one that is not due. Previously the slot was drawn
+    // uniformly, which ignored the schedule entirely.
+    const subj = subjectiveQuestions
+    if (subj.length < 2) return
+    const overdueQ = subj[0]
+    const notDueQ = subj[1]
+    const records = new Map<string, QRecord>([
+      [
+        overdueQ.id,
+        // Attempted, not trained today, well overdue.
+        { ...freshRecord(overdueQ.id, NOW), attempts: 3, lastSeenAt: NOW - 10 * DAY, nextReviewAt: NOW - 5 * DAY },
+      ],
+      [
+        notDueQ.id,
+        // Attempted, not trained today, scheduled far ahead.
+        { ...freshRecord(notDueQ.id, NOW), attempts: 3, lastSeenAt: NOW - 2 * DAY, nextReviewAt: NOW + 30 * DAY },
+      ],
+    ])
+    // Force a wide objective bank so the plan is never empty.
+    const plan = buildPlan({
+      objective: objectiveQuestions,
+      subjective: subj,
+      records,
+      now: NOW,
+      size: 5,
+      rng: mulberry32(SEED),
+    })
+    const pickedSubj = plan.questions.filter((q) => q.type === 'short' || q.type === 'material')
+    expect(pickedSubj).toHaveLength(1)
+    expect(pickedSubj[0].id, 'the overdue subjective question must be preferred over the not-due one').toBe(overdueQ.id)
+  })
+
+  it('the subjective slot does not repeat a question trained today when others exist', () => {
+    const subj = subjectiveQuestions
+    if (subj.length < 2) return
+    const trainedTodayQ = subj[0]
+    const otherQ = subj[1]
+    const earlierToday = startOfLocalDay(NOW) + 3600_000
+    const records = new Map<string, QRecord>([
+      [
+        trainedTodayQ.id,
+        { ...freshRecord(trainedTodayQ.id, NOW), attempts: 2, lastSeenAt: earlierToday, nextReviewAt: NOW - DAY },
+      ],
+      [otherQ.id, { ...freshRecord(otherQ.id, NOW), attempts: 2, lastSeenAt: NOW - 3 * DAY, nextReviewAt: NOW - DAY }],
+    ])
+    const plan = buildPlan({
+      objective: objectiveQuestions,
+      subjective: subj,
+      records,
+      now: NOW,
+      size: 5,
+      rng: mulberry32(SEED),
+    })
+    const pickedSubj = plan.questions.filter((q) => q.type === 'short' || q.type === 'material')
+    expect(pickedSubj).toHaveLength(1)
+    expect(pickedSubj[0].id).not.toBe(trainedTodayQ.id)
   })
 })

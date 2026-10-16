@@ -215,12 +215,43 @@ export function buildPlan(input: PlanInput): PlanResult {
   const dueInPlan = objectivePicks.filter((q) => dueIds.has(q.id)).length
   const deferredDue = Math.max(0, duePool.length - dueInPlan)
 
-  // One extra subjective question, drawn from the same source. Independent of
-  // the objective quota so writing practice is never crowded out.
+  // One extra subjective question, independent of the objective quota so writing
+  // practice is never crowded out.
+  //
+  // Priority: a question that is DUE for review comes first (its schedule says
+  // it should reappear now); otherwise a never-trained one (coverage); otherwise
+  // any. Picking uniformly across all subjective questions regardless of state
+  // would ignore the spaced-repetition schedule for writing practice entirely.
   let subjectivePicks: Question[] = []
   if (subjective.length > 0) {
-    const idx = Math.min(subjective.length - 1, Math.floor(rng() * subjective.length))
-    subjectivePicks = [subjective[idx]]
+    // Rotate away from questions already trained today when alternatives exist.
+    const { notToday, today } = splitByToday(subjective, records, now)
+    const pool = notToday.length > 0 ? notToday : today
+    const isOverdue = (q: Question) => {
+      const r = records.get(q.id)
+      return !!r && isRecordDue(r, now)
+    }
+    const isUntrained = (q: Question) => (records.get(q.id)?.attempts ?? 0) === 0
+    const overdue = pool.filter(isOverdue)
+    const untrained = pool.filter((q) => !isOverdue(q) && isUntrained(q))
+    const rest = pool.filter((q) => !isOverdue(q) && !isUntrained(q))
+    const ordered = [...overdue, ...untrained, ...rest]
+    if (ordered.length > 0) {
+      // Overdue work is scheduled, not sampled: take the oldest-due first so a
+      // backlog of subjective reviews actually drains. Otherwise rotate within
+      // the group using the day-seeded PRNG.
+      if (overdue.length > 0) {
+        const oldest = overdue.slice().sort((a, b) => {
+          const ra = records.get(a.id)?.nextReviewAt ?? 0
+          const rb = records.get(b.id)?.nextReviewAt ?? 0
+          return ra - rb || a.id.localeCompare(b.id)
+        })
+        subjectivePicks = [oldest[0]]
+      } else {
+        const idx = Math.min(ordered.length - 1, Math.floor(rng() * ordered.length))
+        subjectivePicks = [ordered[idx]]
+      }
+    }
   }
 
   return {
