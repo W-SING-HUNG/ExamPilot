@@ -86,7 +86,13 @@ function baselineWeight(rec: QRecord, now: number): number {
 }
 
 /** Baseline `selectQuestions`, verbatim in behaviour including the 0.05 cut-off. */
-function baselineSelect(pool: Question[], records: Map<string, QRecord>, now: number, count: number, rng: () => number) {
+function baselineSelect(
+  pool: Question[],
+  records: Map<string, QRecord>,
+  now: number,
+  count: number,
+  rng: () => number,
+) {
   if (count <= 0 || pool.length === 0) return []
   const weight = (q: Question) => baselineWeight(records.get(q.id) ?? freshRecord(q.id, now), now)
   const result: Question[] = []

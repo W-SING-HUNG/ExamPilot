@@ -53,15 +53,36 @@ describe('scheduler / weight of never-attempted questions', () => {
     const records = new Map<string, QRecord>([
       [
         qDue.id,
-        { ...freshRecord(qDue.id, NOW), attempts: 5, correctCount: 1, wrongCount: 4, lastSeenAt: NOW - 5 * DAY, nextReviewAt: NOW - DAY },
+        {
+          ...freshRecord(qDue.id, NOW),
+          attempts: 5,
+          correctCount: 1,
+          wrongCount: 4,
+          lastSeenAt: NOW - 5 * DAY,
+          nextReviewAt: NOW - DAY,
+        },
       ],
       [
         qMastered.id,
-        { ...freshRecord(qMastered.id, NOW), status: 'mastered', attempts: 5, correctCount: 5, lastSeenAt: NOW - 9 * DAY, nextReviewAt: NOW - DAY },
+        {
+          ...freshRecord(qMastered.id, NOW),
+          status: 'mastered',
+          attempts: 5,
+          correctCount: 5,
+          lastSeenAt: NOW - 9 * DAY,
+          nextReviewAt: NOW - DAY,
+        },
       ],
       [
         qNotDueWrong.id,
-        { ...freshRecord(qNotDueWrong.id, NOW), attempts: 5, correctCount: 3, wrongCount: 2, lastSeenAt: NOW - DAY, nextReviewAt: NOW + 5 * DAY },
+        {
+          ...freshRecord(qNotDueWrong.id, NOW),
+          attempts: 5,
+          correctCount: 3,
+          wrongCount: 2,
+          lastSeenAt: NOW - DAY,
+          nextReviewAt: NOW + 5 * DAY,
+        },
       ],
     ])
     const wDue = questionWeight(records.get(qDue.id)!, NOW)
@@ -87,7 +108,14 @@ describe('scheduler / weight of never-attempted questions', () => {
     const records = new Map<string, QRecord>([
       [
         overdue.id,
-        { ...freshRecord(overdue.id, NOW), attempts: 6, correctCount: 2, wrongCount: 4, lastSeenAt: NOW - 30 * DAY, nextReviewAt: NOW - DAY },
+        {
+          ...freshRecord(overdue.id, NOW),
+          attempts: 6,
+          correctCount: 2,
+          wrongCount: 4,
+          lastSeenAt: NOW - 30 * DAY,
+          nextReviewAt: NOW - DAY,
+        },
       ],
     ])
     let overduePicked = 0
@@ -108,7 +136,14 @@ describe('scheduler / weight of never-attempted questions', () => {
     const records = new Map<string, QRecord>([
       [
         qWrong.id,
-        { ...freshRecord(qWrong.id, NOW), attempts: 4, correctCount: 2, wrongCount: 2, lastSeenAt: NOW - DAY, nextReviewAt: NOW + 5 * DAY },
+        {
+          ...freshRecord(qWrong.id, NOW),
+          attempts: 4,
+          correctCount: 2,
+          wrongCount: 2,
+          lastSeenAt: NOW - DAY,
+          nextReviewAt: NOW + 5 * DAY,
+        },
       ],
     ])
     const wFresh = questionWeight(freshRecord(qFresh.id, NOW), NOW)

@@ -192,10 +192,7 @@ export function buildPlan(input: PlanInput): PlanResult {
   // --- due: oldest-first within each half of the same-day partition ---------
   {
     const { notToday, today } = splitByToday(duePool, records, now)
-    const ordered = [
-      ...orderDueOldestFirst(notToday, records),
-      ...orderDueOldestFirst(today, records),
-    ]
+    const ordered = [...orderDueOldestFirst(notToday, records), ...orderDueOldestFirst(today, records)]
     push(ordered.slice(0, dueQuota))
   }
 
