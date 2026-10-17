@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useState, useRef } from 'react'
 import { useStore } from './store/StoreContext'
 import { useRoute, type RouteName } from './store/router'
 import { Home } from './pages/Home'
@@ -18,7 +18,12 @@ import { APP_NAME, APP_DESC } from './lib/meta'
 import { Spinner } from './components/ui'
 import { ErrorBoundary } from './components/ErrorBoundary'
 
-const NAV: { group: string; items: { r: RouteName; label: string }[] }[] = [
+interface NavEntry {
+  r: RouteName
+  label: string
+}
+
+const NAV: { group: string; items: NavEntry[] }[] = [
   {
     group: '总览',
     items: [
@@ -54,14 +59,25 @@ const NAV: { group: string; items: { r: RouteName; label: string }[] }[] = [
   },
 ]
 
-function NavItems({ route, nav }: { route: RouteName; nav: (r: RouteName) => void }) {
+const ALL_ITEMS = NAV.flatMap((g) => g.items)
+
+function NavItems({ route, nav, onPicked }: { route: RouteName; nav: (r: RouteName) => void; onPicked?: () => void }) {
   return (
     <>
       {NAV.map((g) => (
-        <div key={g.group}>
+        <div key={g.group} role="group" aria-label={g.group}>
           <div className="nav-group">{g.group}</div>
           {g.items.map((it) => (
-            <button key={it.r} className={`nav-item ${route === it.r ? 'active' : ''}`} onClick={() => nav(it.r)}>
+            <button
+              key={it.r}
+              type="button"
+              className={`nav-item ${route === it.r ? 'active' : ''}`}
+              aria-current={route === it.r ? 'page' : undefined}
+              onClick={() => {
+                nav(it.r)
+                onPicked?.()
+              }}
+            >
               {it.label}
             </button>
           ))}
@@ -84,6 +100,57 @@ function ThemeApplier({ theme }: { theme: string }) {
     return () => mq.removeEventListener('change', apply)
   }, [theme])
   return null
+}
+
+/** Collapsible navigation for tablet and phone, with Escape-to-close. */
+function MobileNav({ route, nav }: { route: RouteName; nav: (r: RouteName) => void }) {
+  const [open, setOpen] = useState(false)
+  const btnRef = useRef<HTMLButtonElement | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setOpen(false)
+        btnRef.current?.focus()
+      }
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [open])
+
+  const currentLabel = ALL_ITEMS.find((i) => i.r === route)?.label ?? APP_NAME
+
+  return (
+    <>
+      <header className="topbar">
+        <button
+          ref={btnRef}
+          type="button"
+          className="btn btn-ghost btn-sm"
+          aria-expanded={open}
+          aria-controls="mobile-menu"
+          aria-label={open ? '关闭导航菜单' : '打开导航菜单'}
+          onClick={() => setOpen((v) => !v)}
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            {open ? (
+              <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            ) : (
+              <path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            )}
+          </svg>
+        </button>
+        <span className="topbar-title">{currentLabel}</span>
+        <span className="topbar-spacer" />
+      </header>
+      {open && (
+        <nav className="mobile-menu" id="mobile-menu" aria-label="主导航">
+          <NavItems route={route} nav={nav} onPicked={() => setOpen(false)} />
+        </nav>
+      )}
+    </>
+  )
 }
 
 export function App() {
@@ -123,21 +190,22 @@ export function App() {
   return (
     <>
       <ThemeApplier theme={settings.theme} />
+      <a className="skip-link" href="#main-content">
+        跳到主要内容
+      </a>
       <div className="app-shell">
         <aside className="sidebar">
           <div className="brand">
             <span className="brand-title">{APP_NAME}</span>
             <span className="brand-sub">{APP_DESC}</span>
           </div>
-          <nav className="nav">
+          <nav className="nav" aria-label="主导航">
             <NavItems route={route} nav={(r) => nav(r)} />
           </nav>
         </aside>
         <div style={{ minWidth: 0 }}>
-          <nav className="mobile-nav">
-            <NavItems route={route} nav={(r) => nav(r)} />
-          </nav>
-          <main className="main">
+          <MobileNav route={route} nav={(r) => nav(r)} />
+          <main className="main" id="main-content" tabIndex={-1}>
             {!ready ? (
               <Spinner label="正在载入题库与学习记录…" />
             ) : (

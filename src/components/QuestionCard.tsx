@@ -105,7 +105,7 @@ export function QuestionCard({
           })}
         </div>
       ) : (
-        <div>
+        <div role={q.type === 'multi' ? 'group' : 'radiogroup'} aria-label="选项">
           {q.options.map((opt, i) => {
             const key = String.fromCharCode(65 + i)
             const isSel = chosenSet.has(key)
@@ -114,10 +114,15 @@ export function QuestionCard({
               if (answerSet.has(key)) cls = 'correct'
               else if (isSel) cls = 'wrong'
             } else if (isSel) cls = 'selected'
+            const stateLabel = reveal ? (answerSet.has(key) ? '（正确答案）' : isSel ? '（你的选择，错误）' : '') : ''
             return (
               <button
                 key={key}
+                type="button"
                 className={`opt ${cls}`}
+                aria-pressed={q.type === 'multi' ? isSel : undefined}
+                aria-checked={q.type === 'single' ? isSel : undefined}
+                role={q.type === 'multi' ? 'checkbox' : q.type === 'single' ? 'radio' : undefined}
                 onClick={() => {
                   if (reveal) return
                   if (q.type === 'single') onChange(key)
@@ -130,8 +135,13 @@ export function QuestionCard({
                 }}
                 disabled={reveal}
               >
-                <span className="opt-key">{key}</span>
-                <span>{opt}</span>
+                <span className="opt-key" aria-hidden="true">
+                  {key}
+                </span>
+                <span className="opt-text">
+                  {opt}
+                  {stateLabel && <span className="sr-only">{stateLabel}</span>}
+                </span>
               </button>
             )
           })}
