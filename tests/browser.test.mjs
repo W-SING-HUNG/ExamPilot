@@ -1621,17 +1621,36 @@ test('browser E2E', async (t) => {
           answeredSubjBaselineAttempts = questionInfo.baseline
         }
 
-        // Submit answer
-        await p.evaluate(() => {
+        // Submit answer. The click must be confirmed: on a slow runner an
+        // unconfirmed click silently does nothing, which previously left the
+        // record unadvanced while the test still counted a submission.
+        const submitClicked = await p.evaluate(() => {
           const btns = Array.from(document.querySelectorAll('button'))
           const submitBtn = btns.find((b) => b.textContent?.includes('确认') || b.textContent?.includes('提交'))
-          submitBtn?.click()
+          if (!submitBtn) return false
+          submitBtn.click()
+          return true
         })
+        assert.equal(submitClicked, true, `a submit button must be available at step ${step}`)
         await new Promise((r) => setTimeout(r, 600))
         submittedCount++
 
         if (questionInfo.isSubj) {
           subjectiveTested = true
+          // The attempt must have been persisted by the submission above. Assert
+          // it here so a missed click reports its real cause instead of surfacing
+          // later as a confusing attempt-count mismatch.
+          const persisted = await p.evaluate(async (id) => {
+            const dbmod = await import('/src/db/database.ts')
+            const r = id ? await dbmod.db.records.get(id) : null
+            return r ? { attempts: r.attempts, lastSeenAt: r.lastSeenAt } : null
+          }, questionInfo.qid)
+          assert.ok(persisted, 'the answered subjective question must have a record')
+          assert.equal(
+            persisted.attempts,
+            answeredSubjBaselineAttempts + 1,
+            `submitting the answer must persist exactly one attempt (baseline ${answeredSubjBaselineAttempts})`,
+          )
           // Must find the AI review button without soft skipping
           const clickedGrade = await p.evaluate(() => {
             const btns = Array.from(document.querySelectorAll('button'))
