@@ -1014,32 +1014,6 @@ textarea {
   }
 }
 
-/* Blur-up for genuinely asynchronous imagery. Container keeps its aspect. */
-.media {
-  position: relative;
-  overflow: hidden;
-  border-radius: var(--radius);
-  background: var(--surface-2);
-}
-.media > img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-.media.is-loading > img {
-  filter: blur(20px);
-  transform: scale(1.02);
-  transition: none;
-}
-.media.is-ready > img {
-  filter: blur(0);
-  transform: none;
-  transition:
-    filter 0.5s ease-out,
-    transform 0.5s ease-out;
-}
-
 /* ============================================================================
    Infinite list
    ========================================================================== */

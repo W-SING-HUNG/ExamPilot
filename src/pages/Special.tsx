@@ -22,7 +22,7 @@ export function Special({ params }: { params: Record<string, string> }) {
   const [session, setSession] = useState<Question[] | null>(null)
   const [sessionId, setSessionId] = useState('')
 
-  const diag = useMemo(() => computeDiagnosis(allQuestions, records as never), [records])
+  const diag = useMemo(() => computeDiagnosis(allQuestions, records), [records])
   const typeStat = diag.types.find((t) => t.type === type)!
 
   const pool = useMemo(() => {
@@ -40,7 +40,7 @@ export function Special({ params }: { params: Record<string, string> }) {
     if (pool.length === 0) return
     const picked = selectQuestions({
       pool,
-      records: records as never,
+      records,
       now: Date.now(),
       count: Math.min(count, pool.length),
     })

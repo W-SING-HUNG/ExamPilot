@@ -14,7 +14,7 @@ export function Plan({ params: _params }: { params: Record<string, string> }) {
   const [sessionId, setSessionId] = useState('')
   const [size, setSize] = useState(20)
 
-  const diag = useMemo(() => computeDiagnosis(allQuestions, records as never), [records])
+  const diag = useMemo(() => computeDiagnosis(allQuestions, records), [records])
 
   // Stable within a render: the plan and the counters it explains must agree.
   const now = Date.now()
@@ -31,7 +31,7 @@ export function Plan({ params: _params }: { params: Record<string, string> }) {
     return buildPlan({
       objective: objectiveQuestions,
       subjective: subjectiveQuestions,
-      records: records as never,
+      records,
       now,
       size,
     })

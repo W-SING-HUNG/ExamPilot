@@ -201,22 +201,6 @@ export function SkTable({ rows = 8 }: { rows?: number }) {
   )
 }
 
-/** Skeleton matching a question card. */
-export function SkQuestion() {
-  return (
-    <div aria-hidden="true">
-      <Sk w={90} h={20} r={999} />
-      <Sk h={18} style={{ marginTop: 14 }} />
-      <Sk w="72%" h={18} style={{ marginTop: 8 }} />
-      <div style={{ marginTop: 20 }} className="col">
-        {Array.from({ length: 4 }, (_, i) => (
-          <Sk key={i} h={46} r={12} />
-        ))}
-      </div>
-    </div>
-  )
-}
-
 /* ============================================================================
  * Deferred loading
  *
@@ -265,45 +249,6 @@ export function Reveal({
           {child}
         </div>
       ))}
-    </div>
-  )
-}
-
-/* ============================================================================
- * Blur-up media
- * ========================================================================== */
-
-/**
- * Aspect-locked container with a blurred placeholder until the image decodes.
- * Only for genuinely asynchronous imagery — text cards never use this.
- */
-export function Media({
-  src,
-  alt,
-  ratio = '16 / 9',
-  className = '',
-  style,
-}: {
-  src: string
-  alt: string
-  ratio?: string
-  className?: string
-  style?: CSSProperties
-}) {
-  const [state, setState] = useState<'loading' | 'ready'>('loading')
-  return (
-    <div
-      className={`media ${state === 'loading' ? 'is-loading' : 'is-ready'} ${className}`}
-      style={{ aspectRatio: ratio, ...style }}
-    >
-      <img
-        src={src}
-        alt={alt}
-        loading="lazy"
-        decoding="async"
-        onLoad={() => setState('ready')}
-        onError={() => setState('ready')}
-      />
     </div>
   )
 }
