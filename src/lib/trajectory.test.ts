@@ -229,8 +229,10 @@ describe('T5 / mastered question coming due', () => {
 // ---------------------------------------------------------------------------
 
 describe('T6 / same-day repeated training', () => {
-  it('prefers questions not yet trained today', () => {
-    if (objectiveQuestions.length < 20) return // needs a pool to rotate within
+  // Needs at least 20 overdue questions so half can be already-trained-today and
+  // the other half is still available to rotate to. Marked as a skip rather than
+  // returning early, so a report never counts a case that did not execute.
+  it.skipIf(objectiveQuestions.length < 20)('prefers questions not yet trained today', () => {
     const records = new Map<string, QRecord>()
     const startOfToday = new Date(NOW)
     startOfToday.setUTCHours(0, 0, 0, 0)
@@ -304,15 +306,15 @@ describe('T7 / small bank', () => {
 // ---------------------------------------------------------------------------
 
 describe('T8 / full bank', () => {
-  it('fills the requested quota from the installed bank', () => {
-    if (!fullBank()) return
+  // These only make sense on the licensed bank; on the sample bank they are
+  // reported as skipped so the summary never claims they ran.
+  it.skipIf(!fullBank())('fills the requested quota from the installed bank', () => {
     const plan = runPlan({ records: new Map(), size: 50 })
     expect(objOf(plan.questions)).toHaveLength(50)
     expect(subjOf(plan.questions)).toHaveLength(1)
   })
 
-  it('builds quickly enough for interactive use', () => {
-    if (!fullBank()) return
+  it.skipIf(!fullBank())('builds quickly enough for interactive use', () => {
     const t0 = Date.now()
     for (let i = 0; i < 5; i++) runPlan({ records: new Map(), size: 50 })
     expect(Date.now() - t0).toBeLessThan(2000)
@@ -324,25 +326,28 @@ describe('T8 / full bank', () => {
 // ---------------------------------------------------------------------------
 
 describe('T9 / subjective and objective mixed', () => {
-  it('subjective training advances the interval without inventing a score', () => {
-    if (subjectiveQuestions.length === 0) return
-    const records = new Map<string, QRecord>()
-    const q = subjectiveQuestions[0]
-    const seen: number[] = []
-    for (let i = 0; i < 6; i++) {
-      trainSubjective(q, records, 1, NOW - 30 * DAY + i * DAY)
-      seen.push(records.get(q.id)!.intervalDays)
-    }
-    expect(seen).toEqual([1, 2, 3, 5, 8, 12])
-    const r = records.get(q.id)!
-    expect(r.status).toBe('learning')
-    expect(r.correctCount).toBe(0)
-    expect(r.wrongCount).toBe(0)
-    expect(r.lastCorrect).toBe(null)
-  })
+  // A bank with no subjective questions cannot exercise these; skip explicitly
+  // so the summary distinguishes "not applicable" from "verified".
+  it.skipIf(subjectiveQuestions.length === 0)(
+    'subjective training advances the interval without inventing a score',
+    () => {
+      const records = new Map<string, QRecord>()
+      const q = subjectiveQuestions[0]
+      const seen: number[] = []
+      for (let i = 0; i < 6; i++) {
+        trainSubjective(q, records, 1, NOW - 30 * DAY + i * DAY)
+        seen.push(records.get(q.id)!.intervalDays)
+      }
+      expect(seen).toEqual([1, 2, 3, 5, 8, 12])
+      const r = records.get(q.id)!
+      expect(r.status).toBe('learning')
+      expect(r.correctCount).toBe(0)
+      expect(r.wrongCount).toBe(0)
+      expect(r.lastCorrect).toBe(null)
+    },
+  )
 
-  it('diagnosis reports subjective training without a correct rate', () => {
-    if (subjectiveQuestions.length === 0) return
+  it.skipIf(subjectiveQuestions.length === 0)('diagnosis reports subjective training without a correct rate', () => {
     const records = new Map<string, QRecord>()
     // Train up to 5, or all of them when the bank is smaller.
     const n = Math.min(5, subjectiveQuestions.length)
@@ -392,8 +397,7 @@ describe('T10 / time advancing changes the due set', () => {
     expect(objOf(plan.questions)).toHaveLength(Math.min(20, objectiveQuestions.length))
   })
 
-  it('a full month of daily practice does not lose any question', () => {
-    if (!fullBank()) return
+  it.skipIf(!fullBank())('a full month of daily practice does not lose any question', () => {
     const records = new Map<string, QRecord>()
     // Simulate 30 days: each day, plan 20 and mark every pick as answered.
     for (let day = 0; day < 30; day++) {
@@ -427,8 +431,7 @@ describe('T10 / time advancing changes the due set', () => {
 // ---------------------------------------------------------------------------
 
 describe('T13 / nothing due and nothing untrained', () => {
-  it('the plan is the subjective slot alone, with no error', () => {
-    if (subjectiveQuestions.length === 0) return
+  it.skipIf(subjectiveQuestions.length === 0)('the plan is the subjective slot alone, with no error', () => {
     const records = new Map<string, QRecord>()
     for (const q of objectiveQuestions) {
       // Trained just now: the 1-day interval keeps everything not-due today.

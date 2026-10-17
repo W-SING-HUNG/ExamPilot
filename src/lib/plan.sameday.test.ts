@@ -37,16 +37,19 @@ const run = (records: Map<string, QRecord>, size: number, rng = mulberry32(SEED)
 describe('plan / same-day de-duplication', () => {
   /**
    * The bank differs by environment (17-question sample bank in CI, licensed
-   * 1000-question bank locally), so sizes below are derived from it. Tests that
-   * need more questions than the installed bank can supply skip rather than
-   * fail, keeping the same assertions meaningful on both scales.
+   * 1000-question bank locally), so sizes below are derived from it.
+   *
+   * A case that needs more questions than the installed bank holds is marked
+   * SKIPPED explicitly rather than returning early: a silent `return` would be
+   * reported as a passing test, which overstates what actually ran.
    */
   const bank = objectiveQuestions.length
+  /** True when the installed bank can support a scenario needing `n` questions. */
+  const canRun = (n: number) => bank >= n
 
-  it('the primary scenario: 20 wrong questions, 10 of them trained today', () => {
+  it.skipIf(!canRun(20))('the primary scenario: 20 wrong questions, 10 of them trained today', () => {
     // 20 questions are in the wrong pool (attempted, wrong, not due).
     // The first 10 were trained EARLIER TODAY; the other 10 have not been today.
-    if (bank < 20) return
     const pool = objectiveQuestions.slice(0, 20)
     const trainedTodayIds = new Set(pool.slice(0, 10).map((q) => q.id))
     const records = new Map<string, QRecord>()
@@ -169,9 +172,8 @@ describe('plan / same-day de-duplication', () => {
     expect(plan.pools.fresh).toBeGreaterThanOrEqual(12)
   })
 
-  it('no hard-coded seed: two different days produce different plans', () => {
+  it.skipIf(!canRun(20))('no hard-coded seed: two different days produce different plans', () => {
     // Needs a pool large enough that two draws can plausibly differ.
-    if (bank < 20) return
     // Build the same records state on two different dates. With a per-day seed
     // the selections must differ across days rather than repeating forever.
     const build = (dayOffset: number) => {
@@ -221,8 +223,7 @@ describe('plan / same-day de-duplication', () => {
     expect(a).toEqual(b)
   })
 
-  it('an explicit rng still overrides the day seed', () => {
-    if (bank < 8) return
+  it.skipIf(!canRun(8))('an explicit rng still overrides the day seed', () => {
     const records = new Map<string, QRecord>()
     objectiveQuestions.slice(0, Math.min(40, bank)).forEach((q) => {
       records.set(q.id, {
@@ -240,8 +241,7 @@ describe('plan / same-day de-duplication', () => {
     expect(a.join(',')).not.toBe(b.join(','))
   })
 
-  it('same-day protection does not disturb the due/wrong/fresh quotas', () => {
-    if (bank < 20) return
+  it.skipIf(!canRun(20))('same-day protection does not disturb the due/wrong/fresh quotas', () => {
     // 6 due (3 today-free), plenty wrong and fresh; size 20.
     const records = new Map<string, QRecord>()
     const earlierToday = startOfLocalDay(NOW) + 3600_000
@@ -307,12 +307,11 @@ describe('plan / same-day de-duplication', () => {
     expect(objOf(plan.questions)).toHaveLength(10)
   })
 
-  it('the subjective slot prefers a question that is due for review', () => {
+  it.skipIf(subjectiveQuestions.length < 2)('the subjective slot prefers a question that is due for review', () => {
     // A subjective question that has come due must have a better chance of
     // reappearing than one that is not due. Previously the slot was drawn
     // uniformly, which ignored the schedule entirely.
     const subj = subjectiveQuestions
-    if (subj.length < 2) return
     const overdueQ = subj[0]
     const notDueQ = subj[1]
     const records = new Map<string, QRecord>([
@@ -341,29 +340,39 @@ describe('plan / same-day de-duplication', () => {
     expect(pickedSubj[0].id, 'the overdue subjective question must be preferred over the not-due one').toBe(overdueQ.id)
   })
 
-  it('the subjective slot does not repeat a question trained today when others exist', () => {
-    const subj = subjectiveQuestions
-    if (subj.length < 2) return
-    const trainedTodayQ = subj[0]
-    const otherQ = subj[1]
-    const earlierToday = startOfLocalDay(NOW) + 3600_000
-    const records = new Map<string, QRecord>([
-      [
-        trainedTodayQ.id,
-        { ...freshRecord(trainedTodayQ.id, NOW), attempts: 2, lastSeenAt: earlierToday, nextReviewAt: NOW - DAY },
-      ],
-      [otherQ.id, { ...freshRecord(otherQ.id, NOW), attempts: 2, lastSeenAt: NOW - 3 * DAY, nextReviewAt: NOW - DAY }],
-    ])
-    const plan = buildPlan({
-      objective: objectiveQuestions,
-      subjective: subj,
-      records,
-      now: NOW,
-      size: 5,
-      rng: mulberry32(SEED),
-    })
-    const pickedSubj = plan.questions.filter((q) => q.type === 'short' || q.type === 'material')
-    expect(pickedSubj).toHaveLength(1)
-    expect(pickedSubj[0].id).not.toBe(trainedTodayQ.id)
-  })
+  it.skipIf(subjectiveQuestions.length < 2)(
+    'the subjective slot does not repeat a question trained today when others exist',
+    () => {
+      const subj = subjectiveQuestions
+      const trainedTodayQ = subj[0]
+      const otherQ = subj[1]
+      const earlierToday = startOfLocalDay(NOW) + 3600_000
+      const records = new Map<string, QRecord>([
+        [
+          trainedTodayQ.id,
+          {
+            ...freshRecord(trainedTodayQ.id, NOW),
+            attempts: 2,
+            lastSeenAt: earlierToday,
+            nextReviewAt: NOW - DAY,
+          },
+        ],
+        [
+          otherQ.id,
+          { ...freshRecord(otherQ.id, NOW), attempts: 2, lastSeenAt: NOW - 3 * DAY, nextReviewAt: NOW - DAY },
+        ],
+      ])
+      const plan = buildPlan({
+        objective: objectiveQuestions,
+        subjective: subj,
+        records,
+        now: NOW,
+        size: 5,
+        rng: mulberry32(SEED),
+      })
+      const pickedSubj = plan.questions.filter((q) => q.type === 'short' || q.type === 'material')
+      expect(pickedSubj).toHaveLength(1)
+      expect(pickedSubj[0].id).not.toBe(trainedTodayQ.id)
+    },
+  )
 })

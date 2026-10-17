@@ -230,8 +230,7 @@ describe('phase-2 acceptance metrics', () => {
 
   // -- M3: same-day repeat rate ---------------------------------------------
 
-  it('M3: a second plan on the same day does not re-serve questions trained today', () => {
-    if (bank < 20) return
+  it.skipIf(bank < 20)('M3: a second plan on the same day does not re-serve questions trained today', () => {
     const startOfToday = new Date(NOW)
     startOfToday.setUTCHours(0, 0, 0, 0)
     const earlierToday = startOfToday.getTime() + 3600_000
