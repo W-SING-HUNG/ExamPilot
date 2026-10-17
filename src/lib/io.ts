@@ -1,4 +1,5 @@
 import type { QRecord, HistoryEntry, MockRun, AiReview, BankData, AppSettings, Question } from './types'
+import { APP_VERSION } from './meta'
 
 export interface ExportPayload {
   schema: string
@@ -183,7 +184,7 @@ export function makeExportPayload(input: {
   return {
     schema: 'exampilot.export.v1',
     exportedAt: Date.now(),
-    appVersion: '0.2.0-beta',
+    appVersion: APP_VERSION,
     settings: input.settings,
     records: input.records,
     history: input.history,

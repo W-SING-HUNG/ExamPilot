@@ -36,7 +36,7 @@ export function Subjective({ params }: { params: Record<string, string> }) {
     if (pool.length === 0) return
     const picked = selectQuestions({
       pool,
-      records: records as never,
+      records,
       now: Date.now(),
       count: Math.min(count, pool.length),
     })
