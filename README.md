@@ -4,7 +4,7 @@
 </p>
 
 <p align="center">
-  <a href="#"><img alt="version" src="https://img.shields.io/badge/version-0.1.0--beta-orange"></a>
+  <a href="#"><img alt="version" src="https://img.shields.io/badge/version-0.2.0-blue"></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue"></a>
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20-brightgreen">
 </p>
@@ -13,7 +13,7 @@
   <em>Open-source study cockpit for the "Introduction to Xi Jinping Thought on Socialism with Chinese Characteristics for a New Era" final exam.</em>
 </p>
 
-> **状态：Beta (v0.1.0-beta)。** 核心功能已实现并通过自动化测试，但尚未经过大规模真实使用验证。请勿视为稳定正式版。
+> **状态：v0.2.0。** 功能完整并通过自动化测试，但**仍缺乏大规模真实使用验证**——请不要把本版本当作已获长期使用检验的稳定产品。
 
 ---
 
