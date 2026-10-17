@@ -128,8 +128,22 @@ jobs:
           done
           echo "ai proxy failed to start"; cat ai-proxy.log; exit 1
 
+      # 两套浏览器 E2E。timeout-minutes 作为护栏：历史上该 Job 约 3 分钟完成，
+      # 若 runner 异常挂起（曾出现步骤 in_progress 超过 40 分钟、日志不可读的
+      # 情况），超时会强制终止并让失败诊断步骤输出 vite / ai-proxy 日志，
+      # 而不是无限占用并阻塞 PR 的必需检查。
       - name: 浏览器 E2E（公开示例题库）
+        timeout-minutes: 15
         run: npm run test:browser
+        env:
+          E2E_BASE: http://localhost:5173
+          CHROME_PATH: /usr/bin/google-chrome-stable
+
+      # 阶段 2 复习策略的端到端行为验证：状态机恢复、计划配额、诊断分类、
+      # 主观题不显示正确率、到期积压顺延提示。
+      - name: 浏览器 E2E（阶段 2 复习策略行为）
+        timeout-minutes: 15
+        run: npm run test:browser:phase2
         env:
           E2E_BASE: http://localhost:5173
           CHROME_PATH: /usr/bin/google-chrome-stable

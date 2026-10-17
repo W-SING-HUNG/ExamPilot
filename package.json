@@ -12,6 +12,7 @@
     "test:watch": "vitest",
     "test:ai": "node tests/ai-proxy.test.mjs",
     "test:browser": "node tests/browser.test.mjs",
+    "test:browser:phase2": "node tests/phase2-ui.test.mjs",
     "test:public-info": "node tests/public-info-check.test.mjs",
     "test:all": "vitest run && node tests/ai-proxy.test.mjs && node tests/browser.test.mjs",
     "typecheck": "tsc -b --noEmit",

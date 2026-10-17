@@ -77,7 +77,8 @@ export function Practice({
               <div className="row-between" style={{ marginBottom: 14 }}>
                 <div className="muted">
                   {chapter}：{chapterStat.total} 题（单选 {chapterStat.single} · 多选 {chapterStat.multi} · 判断{' '}
-                  {chapterStat.judge}）
+                  {chapterStat.judge}
+                  {chapterStat.subjectiveTotal > 0 ? ` · 主观 ${chapterStat.subjectiveTotal}` : ''}）
                 </div>
                 <div className="row" style={{ gap: 12 }}>
                   <span className="muted-2">覆盖 {Math.round(chapterStat.coverage * 100)}%</span>

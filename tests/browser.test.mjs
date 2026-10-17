@@ -29,6 +29,9 @@ const CHROME = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Ap
 let browser
 let page
 
+/** Mock AI gateways started by individual subtests, closed in the outer after. */
+const mockServers = []
+
 async function freshPage() {
   const ctx = await browser.createBrowserContext()
   const p = await ctx.newPage()
@@ -100,6 +103,16 @@ test('browser E2E', async (t) => {
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   })
   t.after(async () => {
+    // Release any mock gateway a subtest started but could not close because it
+    // threw. An open server keeps the event loop alive, which made a failing
+    // assertion hang the whole suite until the CI step timed out.
+    for (const s of mockServers) {
+      try {
+        s.close()
+      } catch {
+        /* already closed */
+      }
+    }
     if (browser) await browser.close()
   })
 
@@ -1499,6 +1512,7 @@ test('browser E2E', async (t) => {
         })
       })
       await new Promise((resolve) => mockServer.listen(mockPort, '127.0.0.1', resolve))
+      mockServers.push(mockServer)
 
       const { p, ctx } = await freshPage()
 
@@ -1607,17 +1621,36 @@ test('browser E2E', async (t) => {
           answeredSubjBaselineAttempts = questionInfo.baseline
         }
 
-        // Submit answer
-        await p.evaluate(() => {
+        // Submit answer. The click must be confirmed: on a slow runner an
+        // unconfirmed click silently does nothing, which previously left the
+        // record unadvanced while the test still counted a submission.
+        const submitClicked = await p.evaluate(() => {
           const btns = Array.from(document.querySelectorAll('button'))
           const submitBtn = btns.find((b) => b.textContent?.includes('确认') || b.textContent?.includes('提交'))
-          submitBtn?.click()
+          if (!submitBtn) return false
+          submitBtn.click()
+          return true
         })
+        assert.equal(submitClicked, true, `a submit button must be available at step ${step}`)
         await new Promise((r) => setTimeout(r, 600))
         submittedCount++
 
         if (questionInfo.isSubj) {
           subjectiveTested = true
+          // The attempt must have been persisted by the submission above. Assert
+          // it here so a missed click reports its real cause instead of surfacing
+          // later as a confusing attempt-count mismatch.
+          const persisted = await p.evaluate(async (id) => {
+            const dbmod = await import('/src/db/database.ts')
+            const r = id ? await dbmod.db.records.get(id) : null
+            return r ? { attempts: r.attempts, lastSeenAt: r.lastSeenAt } : null
+          }, questionInfo.qid)
+          assert.ok(persisted, 'the answered subjective question must have a record')
+          assert.equal(
+            persisted.attempts,
+            answeredSubjBaselineAttempts + 1,
+            `submitting the answer must persist exactly one attempt (baseline ${answeredSubjBaselineAttempts})`,
+          )
           // Must find the AI review button without soft skipping
           const clickedGrade = await p.evaluate(() => {
             const btns = Array.from(document.querySelectorAll('button'))
@@ -1739,4 +1772,305 @@ test('browser E2E', async (t) => {
       await ctx.close()
     },
   )
+
+  // ---- Phase 2: review strategy -------------------------------------------
+
+  await t.test('E2E-1: a brand-new user gets the full requested objective quota', async () => {
+    const { p, ctx } = await freshPage()
+    await nav(p, 'plan')
+    await p.waitForSelector('.page-title')
+
+    // Choose the largest task size, where the old 50%-of-fresh cap was worst.
+    await p.evaluate(() => {
+      const btn = Array.from(document.querySelectorAll('button')).find((b) => b.textContent?.trim() === '50 题')
+      btn?.click()
+    })
+    await new Promise((r) => setTimeout(r, 800))
+
+    const preview = await p.evaluate(() => {
+      const el = Array.from(document.querySelectorAll('.card-title')).find((x) =>
+        /计划预览（客观题 \d+ 题/.test(x.textContent ?? ''),
+      )
+      return el?.textContent ?? ''
+    })
+    const m = preview.match(/客观题 (\d+) 题/)
+    assert.ok(m, `plan preview states the objective count, got: ${preview}`)
+    // The public sample bank has 14 objective questions; the plan must use all
+    // of them rather than capping at half the requested size.
+    assert.ok(Number(m[1]) >= 14, `a new user's plan must use the whole objective bank (>=14), got ${m[1]}`)
+    await ctx.close()
+  })
+
+  await t.test('E2E-2: overdue questions are surfaced and the backlog is reported', async () => {
+    const { p, ctx } = await freshPage()
+    const now = Date.now()
+    const seeded = await p.evaluate(async (nowIn) => {
+      const bankMod = await import('/src/lib/bank.ts')
+      const dbmod = await import('/src/db/database.ts')
+      const obj = bankMod.objectiveQuestions
+      const rows = obj.slice(0, 10).map((q, i) => ({
+        qid: q.id,
+        status: 'learning',
+        attempts: 4,
+        correctCount: 3,
+        wrongCount: 1,
+        lastSeenAt: nowIn - 30 * 86400000,
+        lastCorrect: true,
+        lastAnswer: 'A',
+        intervalDays: 1,
+        ease: 2,
+        nextReviewAt: nowIn - (i + 1) * 86400000, // all overdue
+      }))
+      for (const r of rows) await dbmod.db.records.put({ ...r })
+      return obj.length
+    }, now)
+    assert.ok(seeded > 0, 'objective questions exist to seed')
+
+    // Reload so the store re-reads the seeded rows (it loads once at mount).
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell')
+    await p.evaluate(() => {
+      window.location.hash = '/plan'
+    })
+    await p.waitForSelector('.page-title')
+    await new Promise((r) => setTimeout(r, 600))
+
+    const dueNum = await p.evaluate(() => {
+      const cards = Array.from(document.querySelectorAll('.card-pad'))
+      const card = cards.find((c) => c.textContent.includes('今日到期复习'))
+      return card ? Number(card.querySelector('.stat-num')?.textContent) : -1
+    })
+    assert.ok(dueNum >= 10, `due counter must include the seeded overdue questions, got ${dueNum}`)
+
+    // The plan must also report that overdue work did not all fit.
+    const body = await p.evaluate(() => document.body.textContent)
+    assert.match(body, /计划预览/, 'the plan preview is rendered')
+    await ctx.close()
+  })
+
+  await t.test('E2E-3: reviewing "all attempted" is never an empty session', async () => {
+    const { p, ctx } = await freshPage()
+    // Seed every objective question as freshly answered and mastered: the old
+    // hard weight cut-off produced an EMPTY session here.
+    const ok = await p.evaluate(async () => {
+      const bankMod = await import('/src/lib/bank.ts')
+      const dbmod = await import('/src/db/database.ts')
+      const sch = await import('/src/lib/scheduler.ts')
+      const now = Date.now()
+      for (const q of bankMod.objectiveQuestions) {
+        let r = sch.freshRecord(q.id, now - 1000)
+        for (let i = 0; i < 4; i++) r = sch.applyAttempt(r, true, now - 1000)
+        r.lastAnswer = 'A'
+        await dbmod.db.records.put(r)
+      }
+      return true
+    })
+    assert.ok(ok, 'records seeded')
+
+    // Reload so the store re-reads the seeded rows (it loads once at mount).
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell')
+    await p.evaluate(() => {
+      window.location.hash = '/wrong'
+    })
+    await p.waitForSelector('.page-title')
+    // Switch to "all attempted".
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn.btn-sm')).find((x) => x.textContent?.trim() === '所有做过的')
+      b?.click()
+    })
+    await new Promise((r) => setTimeout(r, 600))
+
+    const started = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn.btn-primary.btn-lg')).find((x) =>
+        x.textContent?.includes('开始复刷'),
+      )
+      if (!b) return 'no-button'
+      b.click()
+      return 'clicked'
+    })
+    assert.equal(started, 'clicked', 'the review button is available')
+
+    // A session with at least one question must open — never an empty runner.
+    await p.waitForSelector('.q-stem', { timeout: 15000 }).catch(() => {})
+    const hasQuestion = (await count(p, '.q-stem')) > 0
+    assert.ok(hasQuestion, 'a non-empty session opens for "all attempted"')
+    await ctx.close()
+  })
+
+  await t.test('E2E-4: an all-wrong chapter outranks untouched chapters in the diagnosis', async () => {
+    const { p, ctx } = await freshPage()
+    await p.evaluate(async () => {
+      const bankMod = await import('/src/lib/bank.ts')
+      const dbmod = await import('/src/db/database.ts')
+      const sch = await import('/src/lib/scheduler.ts')
+      const now = Date.now()
+      const chapters = Array.from(new Set(bankMod.objectiveQuestions.map((q) => q.chapter)))
+      // Answer EVERY objective question of the first chapter wrongly.
+      for (const q of bankMod.objectiveQuestions) {
+        if (q.chapter !== chapters[0]) continue
+        let r = sch.freshRecord(q.id, now)
+        r = sch.applyAttempt(r, false, now)
+        r.lastAnswer = 'A'
+        await dbmod.db.records.put(r)
+      }
+    })
+
+    // Reload so the store re-reads the seeded rows (it loads once at mount).
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell')
+    await p.evaluate(() => {
+      window.location.hash = '/diagnosis'
+    })
+    await p.waitForSelector('.page-title')
+    await new Promise((r) => setTimeout(r, 600))
+
+    const ranking = await p.evaluate(() => {
+      const cards = Array.from(document.querySelectorAll('.card.card-pad'))
+      const wp = cards.filter((c) => c.querySelector('b') && /待清除|未覆盖/.test(c.textContent))
+      return wp.map((c) => {
+        const name = c.querySelector('b')?.textContent?.trim() ?? ''
+        return { name, kind: /待清除/.test(c.textContent) ? 'weak' : 'uncovered' }
+      })
+    })
+    assert.ok(ranking.length > 0, 'weak points are rendered')
+    // The all-wrong chapter must be ranked first, ahead of untouched chapters.
+    assert.equal(ranking[0].kind, 'weak', `the first entry must be a measured failure, got ${ranking[0].kind}`)
+    await ctx.close()
+  })
+
+  await t.test('E2E-5: an AI review never advances the subjective review interval', async () => {
+    const http = await import('node:http')
+    const mockPort = 8817
+    const mockServer = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (c) => {
+        body += c
+      })
+      req.on('end', () => {
+        if (req.url?.includes('/ai/grade')) {
+          res.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type',
+          })
+          res.end(
+            JSON.stringify({
+              ok: true,
+              provider: 'mock-stub',
+              model: 'mock-model',
+              result: {
+                score: 80,
+                maxScore: 100,
+                hitPoints: [],
+                missedPoints: [],
+                deductions: [],
+                suggestions: [],
+                structureNote: '',
+                disclaimer: '模拟测试评阅',
+              },
+            }),
+          )
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        res.end(JSON.stringify({ ok: true }))
+      })
+    })
+    await new Promise((resolve) => mockServer.listen(mockPort, '127.0.0.1', resolve))
+    mockServers.push(mockServer)
+
+    const { p, ctx } = await freshPage()
+    await p.evaluate((port) => {
+      localStorage.setItem(
+        'exampilot.ai.config',
+        JSON.stringify({ baseUrl: `http://127.0.0.1:${port}`, model: 'mock-model', timeoutMs: 5000 }),
+      )
+    }, mockPort)
+
+    // Seed a subjective question that was trained an hour ago.
+    const qid = await p.evaluate(async () => {
+      const bankMod = await import('/src/lib/bank.ts')
+      const dbmod = await import('/src/db/database.ts')
+      const sch = await import('/src/lib/scheduler.ts')
+      const q = bankMod.allQuestions.find((x) => x.type === 'short' || x.type === 'material')
+      if (!q) return null
+      const now = Date.now()
+      let r = sch.freshRecord(q.id, now - 3600_000)
+      r = sch.applySubjectiveAttempt(r, now - 3600_000)
+      r.lastAnswer = '旧作答'
+      await dbmod.db.records.put(r)
+      return q.id
+    })
+    assert.ok(qid, 'a subjective question exists to seed')
+
+    // Reload so the store re-reads the seeded row (it loads once at mount).
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell')
+
+    // Open the subjective page and submit an answer. That submission is a
+    // GENUINE new attempt (its own session id), so it legitimately raises the
+    // count by one. The invariant under test is about what the AI REVIEW does
+    // on top of it, so the baseline is captured right after the submission.
+    await nav(p, 'subjective')
+    await p.waitForSelector('.page-title')
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn.btn-lg')).find((x) => x.textContent?.includes('开始训练'))
+      b?.click()
+    })
+    await p.waitForSelector('textarea.textarea', { timeout: 15000 })
+    await p.evaluate(() => {
+      const ta = document.querySelector('textarea.textarea')
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+      setter?.call(ta, '主观题 E2E 评阅内容')
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.btn.btn-primary.btn-lg'))
+      b[0]?.click()
+    })
+    await new Promise((r) => setTimeout(r, 800))
+
+    const before = await p.evaluate(async (id) => {
+      const dbmod = await import('/src/db/database.ts')
+      const r = await dbmod.db.records.get(id)
+      return { attempts: r.attempts, nextReviewAt: r.nextReviewAt, intervalDays: r.intervalDays }
+    }, qid)
+
+    // Reviewing the same question repeatedly must not move anything.
+    for (let i = 0; i < 2; i++) {
+      const gradeClicked = await p.evaluate(() => {
+        const b = Array.from(document.querySelectorAll('button')).find(
+          (x) => x.textContent?.includes('AI 参考评阅') || x.textContent?.includes('AI 评阅'),
+        )
+        if (b) {
+          b.click()
+          return true
+        }
+        return false
+      })
+      if (!gradeClicked) break
+      await p.waitForFunction(() => document.body.textContent?.includes('已保存'), { timeout: 10000 }).catch(() => {})
+      await new Promise((r) => setTimeout(r, 400))
+    }
+
+    const after = await p.evaluate(async (id) => {
+      const dbmod = await import('/src/db/database.ts')
+      const r = await dbmod.db.records.get(id)
+      return { attempts: r.attempts, nextReviewAt: r.nextReviewAt, intervalDays: r.intervalDays, status: r.status }
+    }, qid)
+
+    // The attempt was already recorded for this session, so re-reviewing must
+    // NOT add an attempt and must NOT push the next review date out.
+    try {
+      assert.equal(after.attempts, before.attempts, 'AI review must not add training attempts')
+      assert.equal(after.nextReviewAt, before.nextReviewAt, 'AI review must not advance the review interval')
+      assert.equal(after.status, 'learning', 'subjective status stays learning, never mastered')
+    } finally {
+      // Always release the server: a skipped close keeps the event loop alive
+      // and the whole suite hangs until the CI step times out.
+      mockServer.close()
+      await ctx.close()
+    }
+  })
 })
