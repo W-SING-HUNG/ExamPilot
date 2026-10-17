@@ -1105,3 +1105,64 @@ describe('write-path idempotency and consistency', () => {
     expect(r.intervalDays).toBe(8)
   })
 })
+
+/**
+ * Clearing history must be reported honestly.
+ *
+ * The page awaits this call and only then announces success, so a rejected
+ * clear must propagate rather than being swallowed. These cases pin the
+ * database-layer contract the page relies on; the browser suite covers the
+ * observable UI consequence of a successful clear.
+ */
+describe('history clear / failure propagation', () => {
+  it('a failing clear rejects and leaves every row intact', async () => {
+    const rows = [0, 1, 2].map((i) => ({
+      id: `hc-${i}`,
+      qid: 'q1',
+      mode: 'practice',
+      sessionId: `s-${i}`,
+      answer: 'A',
+      isCorrect: true as boolean | null,
+      submittedAt: 1000 + i,
+      usedAI: false,
+    }))
+    await db.history.bulkPut(rows)
+    const before = await db.history.count()
+    expect(before).toBe(3)
+
+    const originalClear = db.history.clear.bind(db.history)
+    db.history.clear = (() => Promise.reject(new Error('injected clear failure'))) as typeof db.history.clear
+    try {
+      await expect(db.history.clear()).rejects.toThrow('injected clear failure')
+      // The rejection must not have removed anything.
+      expect(await db.history.count()).toBe(before)
+    } finally {
+      db.history.clear = originalClear
+    }
+
+    // Restoring the real implementation really does clear.
+    await db.history.clear()
+    expect(await db.history.count()).toBe(0)
+  })
+
+  it('a successful clear removes every row and is idempotent', async () => {
+    await db.history.bulkPut(
+      [0, 1, 2, 3].map((i) => ({
+        id: `hs-${i}`,
+        qid: 'q1',
+        mode: 'plan',
+        sessionId: `s-${i}`,
+        answer: 'B',
+        isCorrect: false as boolean | null,
+        submittedAt: 2000 + i,
+        usedAI: false,
+      })),
+    )
+    expect(await db.history.count()).toBe(4)
+    await db.history.clear()
+    expect(await db.history.count()).toBe(0)
+    // Clearing an already-empty table is not an error.
+    await expect(db.history.clear()).resolves.toBeUndefined()
+    expect(await db.history.count()).toBe(0)
+  })
+})

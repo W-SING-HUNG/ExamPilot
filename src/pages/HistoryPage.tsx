@@ -90,6 +90,7 @@ export function HistoryPage({ params: _params }: { params: Record<string, string
   const [mode, setMode] = useState('')
   const [result, setResult] = useState<'' | 'ok' | 'bad' | 'unscored'>('')
   const [q, setQ] = useState('')
+  const [clearing, setClearing] = useState(false)
 
   // The query key drives a full reset of the paged list whenever it changes.
   const queryKey = `${mode}|${result}|${q.trim()}`
@@ -164,12 +165,26 @@ export function HistoryPage({ params: _params }: { params: Record<string, string
                   danger: true,
                 })
                 if (!ok) return
-                void clearHistory()
-                toast('历史已清除')
+                setClearing(true)
+                try {
+                  // Await the real database write before reporting anything: a
+                  // fire-and-forget call would announce success even when the
+                  // clear threw.
+                  await clearHistory()
+                  // The list reads straight from IndexedDB, so it must be
+                  // invalidated explicitly — clearing the Store does not touch
+                  // the paged copy already on screen.
+                  list.reset()
+                  toast('历史已清除')
+                } catch (e) {
+                  toast(`清空失败：${(e as Error).message}。未删除任何记录。`)
+                } finally {
+                  setClearing(false)
+                }
               }}
-              disabled={history.length === 0}
+              disabled={history.length === 0 || clearing}
             >
-              清空历史
+              {clearing ? '正在清空…' : '清空历史'}
             </button>
           </div>
         }

@@ -685,4 +685,197 @@ test('phase-3 UI/UX', async (t) => {
     assert.deepEqual(errors, [], 'no page errors')
     await ctx.close()
   })
+
+  // ---- 9. list invalidation and retry after failure ------------------------
+
+  await t.test('P-3: clearing history empties the paged list and reports success only after the write', async () => {
+    const { p, ctx, errors } = await freshPage({ width: 1280, height: 800 })
+    // Seed enough rows that the list is genuinely populated before clearing.
+    const seeded = await p.evaluate(async () => {
+      const bankMod = await import('/src/lib/bank.ts')
+      const dbmod = await import('/src/db/database.ts')
+      const now = Date.now()
+      const qs = bankMod.objectiveQuestions
+      const rows = []
+      for (let i = 0; i < 25; i++) {
+        const q = qs[i % qs.length]
+        rows.push({
+          id: `hc-${i}`,
+          qid: q.id,
+          mode: 'practice',
+          sessionId: `s-${i}`,
+          answer: 'A',
+          isCorrect: true,
+          submittedAt: now - i * 60_000,
+          usedAI: false,
+        })
+      }
+      await dbmod.db.history.bulkPut(rows)
+      return rows.length
+    })
+    assert.ok(seeded > 0, 'history rows were seeded')
+
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell')
+    await nav(p, 'history')
+    await p.waitForSelector('.tbl tbody tr', { timeout: 15000 })
+    const beforeRows = await p.evaluate(() => document.querySelectorAll('.tbl tbody tr').length)
+    assert.ok(beforeRows > 0, `the list is populated before clearing, got ${beforeRows}`)
+
+    // Clear through the real UI.
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('button')).find((x) => x.textContent?.includes('清空历史'))
+      b?.click()
+    })
+    await p.waitForSelector('.dialog[role="alertdialog"]', { timeout: 5000 })
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.dialog-actions button')).find((x) =>
+        x.textContent?.includes('清空历史'),
+      )
+      b?.click()
+    })
+
+    // The success toast must only appear once the write has completed, and the
+    // paged list must be invalidated so it reflects the empty database.
+    await p.waitForFunction(() => document.body.textContent?.includes('历史已清除'), { timeout: 10000 })
+    await p.waitForFunction(
+      () => document.querySelectorAll('.tbl tbody tr').length === 0 && !!document.querySelector('.empty'),
+      { timeout: 10000 },
+    )
+    const after = await p.evaluate(async () => {
+      const dbmod = await import('/src/db/database.ts')
+      const rows = await dbmod.db.history.count()
+      return {
+        dbCount: rows,
+        renderedRows: document.querySelectorAll('.tbl tbody tr').length,
+        hasEmpty: !!document.querySelector('.empty'),
+      }
+    })
+    assert.equal(after.dbCount, 0, 'the database really is empty')
+    assert.equal(after.renderedRows, 0, 'the paged list was invalidated and shows no rows')
+    assert.ok(after.hasEmpty, 'an empty state replaces the table')
+
+    // A reload must agree: the clear was committed, not just hidden.
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell')
+    await nav(p, 'history')
+    await new Promise((r) => setTimeout(r, 700))
+    const afterReload = await p.evaluate(() => document.querySelectorAll('.tbl tbody tr').length)
+    assert.equal(afterReload, 0, 'the clear survives a reload')
+    assert.deepEqual(errors, [], 'no page errors')
+    await ctx.close()
+  })
+
+  await t.test('P-4: the clear control is disabled once there is nothing to clear', async () => {
+    const { p, ctx, errors } = await freshPage({ width: 1280, height: 800 })
+    await p.evaluate(async () => {
+      const bankMod = await import('/src/lib/bank.ts')
+      const dbmod = await import('/src/db/database.ts')
+      const now = Date.now()
+      const q = bankMod.objectiveQuestions[0]
+      await dbmod.db.history.bulkPut([
+        {
+          id: 'hd-0',
+          qid: q.id,
+          mode: 'practice',
+          sessionId: 's-0',
+          answer: 'A',
+          isCorrect: true,
+          submittedAt: now,
+          usedAI: false,
+        },
+      ])
+    })
+    await p.reload({ waitUntil: 'networkidle2' })
+    await p.waitForSelector('.app-shell')
+    await nav(p, 'history')
+    await p.waitForSelector('.tbl tbody tr', { timeout: 15000 })
+
+    const enabledBefore = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('button')).find((x) => x.textContent?.includes('清空历史'))
+      return b ? !b.disabled : null
+    })
+    assert.equal(enabledBefore, true, 'the clear control is enabled while rows exist')
+
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('button')).find((x) => x.textContent?.includes('清空历史'))
+      b?.click()
+    })
+    await p.waitForSelector('.dialog[role="alertdialog"]', { timeout: 5000 })
+    await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.dialog-actions button')).find((x) =>
+        x.textContent?.includes('清空历史'),
+      )
+      b?.click()
+    })
+    await p.waitForFunction(() => document.body.textContent?.includes('历史已清除'), { timeout: 10000 })
+    await p.waitForFunction(() => document.querySelectorAll('.tbl tbody tr').length === 0, { timeout: 10000 })
+
+    const enabledAfter = await p.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('button')).find((x) => x.textContent?.includes('清空历史'))
+      return b ? !b.disabled : null
+    })
+    assert.equal(enabledAfter, false, 'the clear control is disabled once the history is empty')
+    assert.deepEqual(errors, [], 'no page errors')
+    await ctx.close()
+  })
+
+  await t.test('P-5: an empty store renders an empty state, and a reload appends each row once', async () => {
+    const { p, ctx, errors } = await freshPage({ width: 1280, height: 800 })
+
+    // Start from a genuinely empty history so the first page resolves to the
+    // empty state rather than a failure.
+    await nav(p, 'history')
+    await p.waitForFunction(
+      () => document.querySelector('.empty') !== null || document.querySelectorAll('.tbl tbody tr').length === 0,
+      {
+        timeout: 20000,
+      },
+    )
+    const emptyRows = await p.evaluate(() => document.querySelectorAll('.tbl tbody tr').length)
+    assert.equal(emptyRows, 0, 'an empty store renders no rows')
+
+    // Insert rows while the page is open, then force a first-page reload through
+    // a filter change. The reload must show each row exactly once — this is the
+    // regression for a retry/reset that re-requests but appends into stale state.
+    const inserted = await p.evaluate(async () => {
+      const bankMod = await import('/src/lib/bank.ts')
+      const dbmod = await import('/src/db/database.ts')
+      const now = Date.now()
+      const q = bankMod.objectiveQuestions[0]
+      const rows = [0, 1, 2].map((i) => ({
+        id: `hp-${i}`,
+        qid: q.id,
+        mode: 'plan',
+        sessionId: `s-${i}`,
+        answer: 'C',
+        isCorrect: true,
+        submittedAt: now - i * 60_000,
+        usedAI: false,
+      }))
+      await dbmod.db.history.bulkPut(rows)
+      return rows.length
+    })
+    assert.equal(inserted, 3, 'three rows were inserted')
+
+    await p.select('#hist-result', 'ok')
+    await p.waitForFunction(() => document.querySelectorAll('.tbl tbody tr').length === 3, { timeout: 20000 })
+    await new Promise((r) => setTimeout(r, 600))
+    const reloaded = await p.evaluate(() => ({
+      rows: document.querySelectorAll('.tbl tbody tr').length,
+      stamps: Array.from(document.querySelectorAll('.tbl tbody tr')).map(
+        (tr) => tr.querySelector('.code')?.textContent?.trim() ?? '',
+      ),
+    }))
+    assert.equal(reloaded.rows, 3, `the reload shows each row once, got ${reloaded.rows}`)
+    assert.equal(new Set(reloaded.stamps).size, reloaded.stamps.length, 'no duplicated or stale rows after the reload')
+
+    // Switching the filter again must replace, not accumulate.
+    await p.select('#hist-result', 'bad')
+    await p.waitForFunction(() => document.querySelectorAll('.tbl tbody tr').length === 0, { timeout: 20000 })
+    const afterBad = await p.evaluate(() => document.querySelectorAll('.tbl tbody tr').length)
+    assert.equal(afterBad, 0, 'a filter with no matches replaces the list rather than appending')
+    assert.deepEqual(errors, [], 'no page errors')
+    await ctx.close()
+  })
 })

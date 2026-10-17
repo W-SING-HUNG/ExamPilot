@@ -332,60 +332,80 @@ export function useInfiniteList<T>(
   const [error, setError] = useState<string | null>(null)
 
   // Guards: one request at a time, and a generation so a stale response from a
-  // previous query key can never append into the new list.
+  // previous query can never land in the new list.
   const busy = useRef(false)
   const gen = useRef(0)
+  // Read the current length without making callbacks depend on it, so `loadMore`
+  // keeps a stable identity across appends.
+  const lenRef = useRef(0)
+  lenRef.current = items.length
 
-  const reset = useCallback(() => {
+  /**
+   * Fetch one page at an explicit offset.
+   *
+   * Taking the offset as a parameter rather than reading `items.length` is what
+   * makes a first-page reload possible: the caller can ask for offset 0 while the
+   * list still holds rows (a refresh), or while it is empty (a retry after a
+   * failure). `offset === 0` replaces the list; anything else appends.
+   */
+  const run = useCallback(
+    async (offset: number) => {
+      if (busy.current) return
+      const myGen = gen.current
+      busy.current = true
+      setLoading(true)
+      try {
+        const page = await load(offset, pageSize)
+        if (myGen !== gen.current) return
+        setItems((prev) => (offset === 0 ? page.items : [...prev, ...page.items]))
+        setHasMore(page.hasMore)
+        setError(null)
+      } catch (e) {
+        if (myGen !== gen.current) return
+        setError(e instanceof Error ? e.message : String(e))
+        setHasMore(false)
+      } finally {
+        if (myGen === gen.current) {
+          busy.current = false
+          setLoading(false)
+        }
+      }
+    },
+    [load, pageSize],
+  )
+
+  // Held in a ref so the effect below can call the latest `run` without taking a
+  // dependency on it: `load` identity changes when filters change, and depending
+  // on it here would fire the initial load twice per filter change.
+  const runRef = useRef(run)
+  runRef.current = run
+
+  // Bumping this restarts the list. Needed because clearing state alone does not
+  // reload: after a first-page failure `items.length` is already 0, so an effect
+  // keyed on it would never run again and "retry" would be a dead button.
+  const [resetToken, setResetToken] = useState(0)
+
+  // First page: on mount, whenever the query key changes, and on an explicit
+  // reset. The generation bump invalidates any in-flight request, and the list is
+  // cleared so stale rows cannot survive a filter change.
+  useEffect(() => {
     gen.current += 1
     busy.current = false
     setItems([])
     setHasMore(true)
     setError(null)
-    setLoading(true)
+    void runRef.current(0)
+  }, [key, resetToken])
+
+  /** Load the next page. */
+  const loadMore = useCallback(() => run(lenRef.current), [run])
+
+  /** Discard everything and re-request the first page. Works after a failure. */
+  const reset = useCallback(() => {
+    setResetToken((t) => t + 1)
   }, [])
 
-  // Restart whenever the key changes (filters/search).
-  useEffect(() => {
-    reset()
-  }, [key, reset])
-
-  const loadMore = useCallback(async () => {
-    if (busy.current) return
-    const myGen = gen.current
-    busy.current = true
-    setLoading(true)
-    // The offset is captured at request time; it also decides whether this
-    // response replaces the list or extends it. Relying on `setItems([])` from
-    // reset() would race: the first page of a new query can arrive before that
-    // state update commits, and appending to the stale array would keep rows
-    // from the previous filter.
-    const offset = items.length
-    try {
-      const page = await load(offset, pageSize)
-      if (myGen !== gen.current) return
-      setItems((prev) => (offset === 0 ? page.items : [...prev, ...page.items]))
-      setHasMore(page.hasMore)
-      setError(null)
-    } catch (e) {
-      if (myGen !== gen.current) return
-      setError(e instanceof Error ? e.message : String(e))
-      setHasMore(false)
-    } finally {
-      if (myGen === gen.current) {
-        busy.current = false
-        setLoading(false)
-      }
-    }
-  }, [items.length, load, pageSize])
-
-  // First page on mount and after each reset. Keyed on `key` only: `items.length`
-  // and `loadMore` change as pages append, and re-running on those would refetch.
-  useEffect(() => {
-    if (items.length === 0) void loadMore()
-  }, [key, items.length, loadMore])
-
-  return { items, hasMore, loading, error, loadMore, reset }
+  return { items, hasMore, loading, error, loadMore, reset, retry: reset }
 }
 
 /**
