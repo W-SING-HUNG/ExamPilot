@@ -148,6 +148,16 @@ jobs:
           E2E_BASE: http://localhost:5173
           CHROME_PATH: /usr/bin/google-chrome-stable
 
+      # 阶段 3 的界面回归：五个断点下的溢出与可达性、移动端导航、键盘与跳转
+      # 链接、动效层与 prefers-reduced-motion、真实分页与筛选重置、AI 请求取消、
+      # 空状态与危险操作对话框。
+      - name: 浏览器 E2E（阶段 3 界面与交互）
+        timeout-minutes: 15
+        run: npm run test:browser:phase3
+        env:
+          E2E_BASE: http://localhost:5173
+          CHROME_PATH: /usr/bin/google-chrome-stable
+
       - name: 失败时上传诊断日志
         if: failure()
         run: |

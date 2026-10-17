@@ -355,10 +355,16 @@ export function useInfiniteList<T>(
     const myGen = gen.current
     busy.current = true
     setLoading(true)
+    // The offset is captured at request time; it also decides whether this
+    // response replaces the list or extends it. Relying on `setItems([])` from
+    // reset() would race: the first page of a new query can arrive before that
+    // state update commits, and appending to the stale array would keep rows
+    // from the previous filter.
+    const offset = items.length
     try {
-      const page = await load(items.length, pageSize)
+      const page = await load(offset, pageSize)
       if (myGen !== gen.current) return
-      setItems((prev) => [...prev, ...page.items])
+      setItems((prev) => (offset === 0 ? page.items : [...prev, ...page.items]))
       setHasMore(page.hasMore)
       setError(null)
     } catch (e) {
