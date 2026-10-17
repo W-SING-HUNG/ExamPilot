@@ -264,14 +264,21 @@ export function MockExam({
       {phase === 'running' && q && (
         <>
           <CardPad>
-            <div className="row-between" style={{ marginBottom: 10 }}>
+            <div className="row-between" style={{ marginBottom: 12 }}>
               <div className="row" style={{ gap: 12 }}>
                 <span className="muted">
                   第 {idx + 1} / {paper.length} 题
                 </span>
-                <span className="muted-2">已答 {answeredCount}</span>
+                <Tag tone={answeredCount === paper.length ? 'ok' : 'plain'}>
+                  已答 {answeredCount} / {paper.length}
+                </Tag>
               </div>
-              <div className={`timer ${remaining < 5 * 60000 ? 'urgent' : ''}`}>
+              <div
+                className={`timer ${remaining < 5 * 60000 ? 'urgent' : ''}`}
+                role="timer"
+                aria-live={remaining < 5 * 60000 ? 'assertive' : 'off'}
+                aria-label={`剩余时间 ${mm} 分 ${ss} 秒`}
+              >
                 {String(mm).padStart(2, '0')}:{String(ss).padStart(2, '0')}
               </div>
             </div>
@@ -292,7 +299,7 @@ export function MockExam({
             />
           </div>
 
-          <div className="btn-row" style={{ marginTop: 14 }}>
+          <div className="btn-row" style={{ marginTop: 16, gap: 10 }}>
             <button className="btn" onClick={() => setIdx((i) => Math.max(0, i - 1))} disabled={idx === 0}>
               上一题
             </button>
@@ -303,13 +310,23 @@ export function MockExam({
             >
               下一题
             </button>
-            <button className="btn btn-ghost" onClick={() => setAnswers((a) => ({ ...a, [q.id]: null }))}>
+            <button
+              className="btn btn-ghost"
+              onClick={() => setAnswers((a) => ({ ...a, [q.id]: null }))}
+              disabled={!answers[q.id]}
+            >
               清除本题
             </button>
             <span style={{ flex: 1 }} />
-            <button className="btn btn-primary" onClick={() => void submitAll(false)}>
+            <button className="btn btn-primary btn-lg" onClick={() => void submitAll(false)}>
               交卷并评分
             </button>
+          </div>
+
+          <div className="muted-2" style={{ marginTop: 8 }}>
+            {answeredCount < paper.length
+              ? `还有 ${paper.length - answeredCount} 题未作答。未作答的客观题不计对错，也不进入错题本。`
+              : '全部题目已作答，可以交卷。'}
           </div>
 
           <div className="pill-scroll" style={{ marginTop: 12 }}>

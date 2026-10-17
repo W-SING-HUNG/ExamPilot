@@ -13,6 +13,7 @@ export default tseslint.config(
       'src/lib/local-bank.generated.ts',
       'tools/**',
       'tests/**',
+      'scratch/**',
       '*.config.ts',
       '*.config.js',
     ],

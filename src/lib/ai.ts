@@ -53,9 +53,28 @@ export interface AiGradeResponse {
   model?: string
 }
 
-async function postJson<T>(url: string, body: unknown, timeoutMs: number): Promise<T> {
+/**
+ * POST JSON with both a timeout and an optional caller-supplied signal.
+ *
+ * The caller's signal exists so the UI can genuinely cancel an in-flight
+ * request; aborting produces `{ok:false, reason:'已取消'}` rather than throwing,
+ * so callers keep their single error path.
+ */
+async function postJson<T>(url: string, body: unknown, timeoutMs: number, external?: AbortSignal): Promise<T> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  let cancelled = false
+  const onExternalAbort = () => {
+    cancelled = true
+    ctrl.abort()
+  }
+  if (external) {
+    if (external.aborted) {
+      clearTimeout(timer)
+      return { ok: false, reason: '已取消' } as unknown as T
+    }
+    external.addEventListener('abort', onExternalAbort, { once: true })
+  }
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -73,11 +92,12 @@ async function postJson<T>(url: string, body: unknown, timeoutMs: number): Promi
     return data as T
   } catch (e) {
     if ((e as Error).name === 'AbortError') {
-      return { ok: false, reason: `请求超时（>${timeoutMs}ms）` } as unknown as T
+      return { ok: false, reason: cancelled ? '已取消' : `请求超时（>${timeoutMs}ms）` } as unknown as T
     }
     return { ok: false, reason: `网络错误：${(e as Error).message}` } as unknown as T
   } finally {
     clearTimeout(timer)
+    external?.removeEventListener('abort', onExternalAbort)
   }
 }
 
@@ -98,14 +118,14 @@ export function setAiConfig(c: Partial<AiConfig>): void {
   localStorage.setItem('exampilot.ai.config', JSON.stringify({ ...getAiConfig(), ...c }))
 }
 
-export async function aiAskQuestion(req: AiQaRequest): Promise<AiQaResponse> {
+export async function aiAskQuestion(req: AiQaRequest, signal?: AbortSignal): Promise<AiQaResponse> {
   const cfg = getAiConfig()
-  return postJson<AiQaResponse>(`${cfg.baseUrl}/ai/qa`, req, cfg.timeoutMs)
+  return postJson<AiQaResponse>(`${cfg.baseUrl}/ai/qa`, req, cfg.timeoutMs, signal)
 }
 
-export async function aiGrade(req: AiGradeRequest): Promise<AiGradeResponse> {
+export async function aiGrade(req: AiGradeRequest, signal?: AbortSignal): Promise<AiGradeResponse> {
   const cfg = getAiConfig()
-  return postJson<AiGradeResponse>(`${cfg.baseUrl}/ai/grade`, req, cfg.timeoutMs)
+  return postJson<AiGradeResponse>(`${cfg.baseUrl}/ai/grade`, req, cfg.timeoutMs, signal)
 }
 
 export interface AiStatusResponse {

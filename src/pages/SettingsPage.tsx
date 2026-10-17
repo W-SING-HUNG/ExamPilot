@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { useStore } from '../store/StoreContext'
-import { CardPad, PageHead, useToast } from '../components/ui'
+import { CardPad, PageHead, useConfirm, useToast } from '../components/ui'
 import type { AppSettings } from '../lib/types'
 
 export function SettingsPage({ params: _params }: { params: Record<string, string> }) {
   const { settings, ready, updateSettings, resetAllProgress } = useStore()
   const { toast, el } = useToast()
+  const { confirm, confirmEl } = useConfirm()
   const [draft, setDraft] = useState<AppSettings>(settings)
 
   if (!ready) return null
@@ -95,11 +96,16 @@ export function SettingsPage({ params: _params }: { params: Record<string, strin
         </div>
         <button
           className="btn btn-danger"
-          onClick={() => {
-            if (confirm('确定要清空全部学习数据吗？此操作不可恢复。')) {
-              void resetAllProgress()
-              toast('已重置')
-            }
+          onClick={async () => {
+            const ok = await confirm({
+              title: '重置全部学习数据？',
+              body: '将删除全部题目记录、练习历史、模拟考试与 AI 评阅。此操作不可恢复，建议先在「导入导出」中备份。',
+              confirmLabel: '确认重置',
+              danger: true,
+            })
+            if (!ok) return
+            void resetAllProgress()
+            toast('已重置')
           }}
         >
           重置全部学习数据
@@ -114,6 +120,7 @@ export function SettingsPage({ params: _params }: { params: Record<string, strin
         </div>
       </CardPad>
       {el}
+      {confirmEl}
     </>
   )
 }

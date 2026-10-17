@@ -3,7 +3,7 @@ import { useStore } from '../store/StoreContext'
 import { allQuestions, chapterOrder, TYPE_LABEL } from '../lib/bank'
 import { selectQuestions } from '../lib/scheduler'
 import { QuestionRunner } from '../components/QuestionRunner'
-import { Bar, CardPad, PageHead, Tag, Empty } from '../components/ui'
+import { Bar, CardPad, PageHead, Tag, Empty, useConfirm } from '../components/ui'
 import type { Question } from '../lib/types'
 import type { RouteName } from '../store/router'
 
@@ -15,6 +15,7 @@ export function WrongBank({
   params: Record<string, string>
 }) {
   const { records, ready, clearWrong } = useStore()
+  const { confirm, confirmEl } = useConfirm()
   const [session, setSession] = useState<Question[] | null>(null)
   const [sessionId, setSessionId] = useState('')
   const [chapter, setChapter] = useState<string>(params.chapter ?? '')
@@ -147,9 +148,16 @@ export function WrongBank({
               {totalWrong > 0 && (
                 <button
                   className="btn btn-danger"
-                  onClick={() => {
+                  onClick={async () => {
                     const qids = allQuestions.filter((q) => (records.get(q.id)?.wrongCount ?? 0) > 0).map((q) => q.id)
-                    if (confirm(`确定清除 ${qids.length} 道错题的记录？此操作不可撤销。`)) void clearWrong(qids)
+                    const ok = await confirm({
+                      title: '清空全部错题记录？',
+                      body: `将从 ${qids.length} 道题上清除错误计数，这些题目会重新回到普通练习池。此操作不可撤销。`,
+                      confirmLabel: '清空错题',
+                      danger: true,
+                    })
+                    if (!ok) return
+                    void clearWrong(qids)
                   }}
                 >
                   清空错题记录
@@ -253,6 +261,7 @@ export function WrongBank({
           finishLabel="完成复刷"
         />
       )}
+      {confirmEl}
     </>
   )
 }

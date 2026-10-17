@@ -1,8 +1,21 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { allQuestions, chapterOrder, TYPE_LABEL } from '../lib/bank'
-import { CardPad, PageHead, Tag, Empty } from '../components/ui'
+import {
+  CardPad,
+  PageHead,
+  Tag,
+  Empty,
+  InfiniteSentinel,
+  ListFoot,
+  SkList,
+  useDeferred,
+  useInfiniteList,
+  type Page as ListPage,
+} from '../components/ui'
 import { answerText } from '../lib/scoring'
 import type { Question, QuestionType } from '../lib/types'
+
+const PAGE_SIZE = 40
 
 export function BankPage({ params: _params }: { params: Record<string, string> }) {
   const [chapter, setChapter] = useState('')
@@ -23,6 +36,20 @@ export function BankPage({ params: _params }: { params: Record<string, string> }
     return list
   }, [chapter, type, kw, onlyFlagged])
 
+  // Pagination pages over the filtered array rather than hiding rows: only the
+  // visible window is mounted, so a 1000-question bank stays responsive on a
+  // phone. The query key resets the list whenever a filter changes.
+  const queryKey = `${chapter}|${type}|${kw.trim()}|${onlyFlagged}`
+  const load = useCallback(
+    (offset: number, limit: number): Promise<ListPage<Question>> => {
+      const slice = filtered.slice(offset, offset + limit)
+      return Promise.resolve({ items: slice, hasMore: offset + limit < filtered.length })
+    },
+    [filtered],
+  )
+  const list = useInfiniteList<Question>(queryKey, load, PAGE_SIZE)
+  const showSkeleton = useDeferred(list.loading && list.items.length === 0)
+
   return (
     <>
       <PageHead
@@ -32,17 +59,25 @@ export function BankPage({ params: _params }: { params: Record<string, string> }
 
       <CardPad>
         <div className="card-title">检索条件</div>
-        <div className="row" style={{ gap: 10, flexWrap: 'wrap' }}>
+        <div className="row wrap" style={{ gap: 10 }}>
+          <label className="sr-only" htmlFor="bank-kw">
+            搜索题干、选项或答案
+          </label>
           <input
+            id="bank-kw"
             className="input"
-            style={{ maxWidth: 240 }}
+            style={{ maxWidth: 260 }}
             placeholder="搜索题干 / 选项 / 答案"
             value={kw}
             onChange={(e) => setKw(e.target.value)}
           />
+          <label className="sr-only" htmlFor="bank-chapter">
+            按章节筛选
+          </label>
           <select
+            id="bank-chapter"
             className="select"
-            style={{ maxWidth: 150 }}
+            style={{ maxWidth: 180 }}
             value={chapter}
             onChange={(e) => setChapter(e.target.value)}
           >
@@ -52,11 +87,14 @@ export function BankPage({ params: _params }: { params: Record<string, string> }
                 {c}
               </option>
             ))}
-            <option value="全册">全册（主观题）</option>
           </select>
+          <label className="sr-only" htmlFor="bank-type">
+            按题型筛选
+          </label>
           <select
+            id="bank-type"
             className="select"
-            style={{ maxWidth: 140 }}
+            style={{ maxWidth: 160 }}
             value={type}
             onChange={(e) => setType(e.target.value as QuestionType | '')}
           >
@@ -67,20 +105,30 @@ export function BankPage({ params: _params }: { params: Record<string, string> }
             <option value="short">简答题</option>
             <option value="material">材料分析题</option>
           </select>
-          <label className="row" style={{ gap: 6, fontSize: 13 }}>
+          <label className="row" style={{ gap: 8, fontSize: 13, minHeight: 36 }}>
             <input type="checkbox" checked={onlyFlagged} onChange={(e) => setOnlyFlagged(e.target.checked)} />
             仅看待校验标记
           </label>
-          <span className="muted-2">共 {filtered.length} 题</span>
+          <span className="muted-2" style={{ marginLeft: 'auto' }}>
+            共 {filtered.length} 题
+          </span>
         </div>
       </CardPad>
 
       <CardPad style={{ marginTop: 14 }}>
-        {filtered.length === 0 ? (
+        {showSkeleton ? (
+          <SkList rows={6} h={64} />
+        ) : list.error ? (
+          <Empty text={`加载失败：${list.error}`}>
+            <button className="btn" onClick={() => list.reset()}>
+              重试
+            </button>
+          </Empty>
+        ) : filtered.length === 0 ? (
           <Empty text="没有符合条件的题目。" />
         ) : (
-          <div className="col" style={{ gap: 8 }}>
-            {filtered.slice(0, 200).map((q) => (
+          <div className="infinite-list">
+            {list.items.map((q) => (
               <BankRow
                 key={q.id}
                 q={q}
@@ -88,7 +136,8 @@ export function BankPage({ params: _params }: { params: Record<string, string> }
                 onToggle={() => setExpanded(expanded === q.id ? null : q.id)}
               />
             ))}
-            {filtered.length > 200 && <div className="muted-2">仅显示前 200 条，请使用筛选缩小范围。</div>}
+            <InfiniteSentinel onHit={() => void list.loadMore()} disabled={!list.hasMore || list.loading} />
+            <ListFoot loading={list.loading && list.items.length > 0} done={!list.hasMore} />
           </div>
         )}
       </CardPad>
@@ -98,10 +147,20 @@ export function BankPage({ params: _params }: { params: Record<string, string> }
 
 function BankRow({ q, open, onToggle }: { q: Question; open: boolean; onToggle: () => void }) {
   return (
-    <div className="card card-pad" style={{ boxShadow: 'none' }}>
+    <div className="card card-pad list-row" style={{ boxShadow: 'none' }}>
       <button
+        type="button"
         className="row-between"
-        style={{ background: 'none', border: 'none', width: '100%', textAlign: 'left' }}
+        style={{
+          background: 'none',
+          border: 'none',
+          width: '100%',
+          textAlign: 'left',
+          padding: 0,
+          minHeight: 32,
+          cursor: 'pointer',
+        }}
+        aria-expanded={open}
         onClick={onToggle}
       >
         <span className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
@@ -117,9 +176,9 @@ function BankRow({ q, open, onToggle }: { q: Question; open: boolean; onToggle: 
         {q.stem.split('\n')[0]}
       </div>
       {open && (
-        <div style={{ marginTop: 8 }}>
+        <div style={{ marginTop: 10 }}>
           {q.options.length > 0 && (
-            <ol style={{ margin: '0 0 8px', paddingLeft: 22, fontSize: 14, lineHeight: 1.9 }}>
+            <ol style={{ margin: '0 0 10px', paddingLeft: 22, fontSize: 14, lineHeight: 1.9 }}>
               {q.options.map((o, i) => (
                 <li
                   key={i}

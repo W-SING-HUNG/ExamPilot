@@ -150,39 +150,43 @@ export function QuestionRunner({
         </div>
       )}
 
-      <div className="btn-row" style={{ marginTop: 16 }}>
+      <div className="btn-row" style={{ marginTop: 18, gap: 10 }}>
         {!reveal ? (
-          <button className="btn btn-primary btn-lg" onClick={submit} disabled={!value}>
-            提交答案
-          </button>
+          <>
+            <button className="btn btn-primary btn-lg" onClick={submit} disabled={!value}>
+              提交答案
+            </button>
+            <span className="muted-2">
+              {isSubjective ? '主观题不自动评分，可提交后使用 AI 参考评阅' : '选择答案后提交，立即查看结果'}
+            </span>
+          </>
         ) : (
           <>
             <button className="btn btn-primary btn-lg" onClick={next}>
               {idx + 1 >= questions.length ? finishLabel : '下一题'}
             </button>
-            {immediateFeedback && !deferred && (
-              <button
-                className="btn"
-                onClick={() => {
-                  setReveal(false)
-                }}
-                disabled
-              >
-                重新作答不可用
-              </button>
-            )}
+            <button
+              className="btn btn-lg"
+              onClick={() => {
+                setIdx((i) => Math.max(0, i - 1))
+              }}
+              disabled={idx === 0}
+            >
+              上一题
+            </button>
           </>
         )}
-        <button
-          className="btn btn-ghost"
-          onClick={() => {
-            setIdx((i) => Math.max(0, i - 1))
-          }}
-          disabled={idx === 0}
-        >
-          上一题
-        </button>
+        {reveal && (
+          <span className="muted-2" style={{ marginLeft: 'auto' }}>
+            第 {idx + 1} / {questions.length} 题
+          </span>
+        )}
       </div>
+      {reveal && (
+        <div className="muted-2" style={{ marginTop: 8 }}>
+          本题已作答并记录，答案不可修改；继续下一题即可。
+        </div>
+      )}
     </div>
   )
 }
